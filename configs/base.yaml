@@ -1,0 +1,152 @@
+# Cascade base configuration (spec Appendix B).
+#
+# Every value the code reads comes from here or from an ablation overlay in
+# configs/ablations/. There are no bare os.environ reads outside config.py.
+
+study:
+  name: cascade-v1
+  salt: "cascade-2026-study-01" # feeds seed derivation (blake2b key)
+  manifest_sha256: null # set by `cascade ledger seal`
+
+models:
+  agent: claude-haiku-4-5-20251001
+  compiler: claude-sonnet-4-6
+  embedding: BAAI/bge-small-en-v1.5
+  temperature: 0.7 # agents; compiler uses compiler_temperature
+  compiler_temperature: 0.2
+  use_batch_api: true
+  # Max output tokens. Agent turns are a constrained JSON action plus a
+  # 30-token rationale cap (spec §7.4), so this is deliberately small.
+  agent_max_tokens: 512
+  compiler_max_tokens: 8192
+
+# Per-million-token list prices, USD. Source of truth for the cost meter.
+# Verified against the Anthropic pricing table; see docs/adr/0001.
+pricing:
+  claude-haiku-4-5-20251001:
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+  claude-sonnet-4-6:
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+# Multipliers applied on top of the per-token list price.
+pricing_multipliers:
+  batch: 0.5 # Batch API discount (spec §12.2)
+  cache_read: 0.1 # cached prefix tokens are billed at ~10% of list
+  cache_write_5m: 1.25 # 5-minute TTL cache write premium
+  cache_write_1h: 2.0 # 1-hour TTL cache write premium
+
+prompt_cache:
+  enabled: true
+  ttl: "1h" # batches can lag well past the 5m default TTL; see ADR-0001
+  # Anthropic will silently refuse to cache a prefix shorter than this many
+  # tokens -- no error, just cache_creation_input_tokens == 0. Haiku 4.5's
+  # floor is 4096. The spec's 1,900-token persona prefix sits below it, which
+  # silently invalidates the entire §12.1 input-cost model. See ADR-0001.
+  min_prefix_tokens: 4096
+  # Fail loudly rather than silently overspending if the prefix is too short.
+  enforce_min_prefix: true
+
+kernel:
+  steps: 24
+  max_step_delta: 0.12
+  contest_gamma: 1.6
+  activation:
+    salience_threshold: 0.06
+    forced_interval: 5
+    max_active_per_step: 8
+  memory:
+    recent_observations: 12
+    summary_interval: 8
+
+aperture:
+  hop1: { noise_sigma: 0.08, lag: 1, quantized: false }
+  hop2: { noise_sigma: 0.15, lag: 2, quantized: true }
+  public: { noise_sigma: 0.03, lag: 0, quantized: false }
+
+retrieval:
+  k_agent: 6
+  k_compiler: 60
+  ivfflat_probes: 10
+  target_p95_ms: 15
+  # Monthly partitions over a 2016-2024 corpus mean a late-cutoff query fans
+  # out across ~100 index scans. Quarterly is the starting point. See ADR-0004.
+  partition_granularity: quarter
+
+ensemble:
+  replicates: 200
+  ablation_replicates: 30
+  bootstrap_b: 10000
+  sigma_multimodal_threshold: 0.30
+
+budget:
+  phase_ceiling_usd:
+    compile: 40.0
+    simulate: 240.0
+    baseline: 30.0
+    corpus: 15.0
+    bench: 5.0
+  abort_on_breach: true
+
+flags: # ablation switches
+  causal_decomposition: true
+  information_asymmetry: true
+  grounding: chronofence # or parametric_only
+
+llm:
+  mode: replay # record | replay | live -- replay is the safe default
+  cache_dir: .cache/llm
+  prompt_rev: "r1"
+  max_retries: 2
+  timeout_s: 600.0
+
+ledger: # scenario registry (spec §3.1)
+  target_scenarios: 180
+  # Base-rate control, enforced by construction. Outside this band a model
+  # that always predicts the base rate scores well for the wrong reason.
+  yes_rate_min: 0.40
+  yes_rate_max: 0.60
+  max_domain_share: 0.25
+  # "Non-trivial volume" for market sources. A thinly traded market's
+  # resolution is less reliable and its price says little about whether the
+  # outcome was genuinely unsettled. Units are source-native -- USD notional
+  # on Polymarket, mana on Manifold -- so this is an activity floor, not a
+  # dollar amount, and the two are never compared or summed.
+  min_volume: 5000
+  # Where in a question's public life the cutoff sits. Proportional rather
+  # than a fixed offset so long and short questions get comparable evidence.
+  # Curated entries override this with an explicit cutoff_ts.
+  cutoff_fraction: 0.5
+  source_cache_dir: .cache/sources
+  curated_dir: data/curated
+  polymarket_pages: 40
+  polymarket_page_size: 100
+  manifold_pages: 40
+  manifold_page_size: 500
+  metaculus_pages: 40
+  metaculus_page_size: 100
+  # CASCADE_METACULUS_TOKEN carries the Metaculus credential (single
+  # underscore: it is a top-level Settings field, see `database` below).
+
+database:
+  host: localhost
+  port: 5433
+  name: cascade
+  # Roles are created by migration 001. Passwords come from the environment
+  # (CASCADE_DB_SIM_PASSWORD etc.), never from this file. Single underscore:
+  # these are top-level Settings fields, not members of this `database`
+  # section, so the `__` nesting delimiter does not apply to them.
+  admin_user: cascade_admin
+  sim_user: cascade_sim
+  eval_user: cascade_eval
+
+langfuse:
+  enabled: true
+  host: http://localhost:3000
+  # Keys come from the environment, single underscore (see `database` above):
+  # CASCADE_LANGFUSE_PUBLIC_KEY / CASCADE_LANGFUSE_SECRET_KEY
+
+paths:
+  checkpoints: .checkpoints
+  reports: reports
+  graphs: graphs

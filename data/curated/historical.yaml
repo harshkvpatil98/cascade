@@ -1,0 +1,289 @@
+# Hand-curated historical scenarios (spec §3.1, target ~40).
+#
+# Multi-party episodes with unambiguous outcomes. These are the scenarios that
+# most stress causal decomposition, because they have the most actors.
+#
+# TEMPLATE — every field is required and the loader refuses the file otherwise:
+#   id                    stable slug; becomes scenario_id as `curated:<id>`
+#   question              binary, resolvable to 0 or 1 with no ambiguity
+#   resolution_criterion  what exactly counted as YES
+#   domain                one of the tags in cascade/ledger/schema.py::Domain
+#   parties               >= 3 distinguishable parties with non-identical
+#                         objectives. Not a cast list: each must have wanted
+#                         something different.
+#   open_ts               when the question became publicly live
+#   cutoff_ts             chosen by judgement: enough public information
+#                         existed to reason, and the outcome was genuinely
+#                         unsettled. Must leave > 21 days to resolution.
+#   resolved_at           when the outcome became fact
+#   outcome               1 = YES, 0 = NO
+#   provenance            how a reviewer checks this entry
+#
+# REVIEW STATUS: authored from the public record, NOT independently verified.
+# Each entry is a hand-written label on a forecasting benchmark, and a wrong
+# label corrupts the headline metric silently. Verify every date and outcome
+# against the cited record before the study is published.
+
+- id: brexit-referendum-2016
+  question: Will the United Kingdom vote to leave the European Union in the June 2016 referendum?
+  resolution_criterion: >-
+    YES if the official result declared by the Electoral Commission is a
+    majority for Leave.
+  domain: elections
+  parties:
+    - UK Government
+    - European Commission
+    - Vote Leave
+    - Britain Stronger in Europe
+    - Scottish Government
+  open_ts: 2016-02-20
+  cutoff_ts: 2016-04-15
+  resolved_at: 2016-06-24
+  outcome: 1
+  provenance: UK Electoral Commission EU referendum result, 23-24 June 2016 (Leave 51.9%).
+
+- id: scottish-independence-referendum-2014
+  question: Will Scotland vote for independence in the September 2014 referendum?
+  resolution_criterion: YES if a majority votes Yes to "Should Scotland be an independent country?".
+  domain: elections
+  parties:
+    - Scottish Government
+    - UK Government
+    - Yes Scotland
+    - Better Together
+    - European Union
+  open_ts: 2013-11-26
+  cutoff_ts: 2014-06-01
+  resolved_at: 2014-09-19
+  outcome: 0
+  provenance: Scottish independence referendum, 18 September 2014 (No 55.3%).
+
+- id: colombia-peace-plebiscite-2016
+  question: Will Colombian voters approve the government-FARC peace agreement in the October 2016 plebiscite?
+  resolution_criterion: YES if the Yes option obtains a majority of valid votes.
+  domain: geopolitics
+  parties:
+    - Government of Colombia
+    - FARC-EP
+    - Cuba
+    - Norway
+    - Democratic Center opposition
+  open_ts: 2016-06-23
+  cutoff_ts: 2016-08-25
+  resolved_at: 2016-10-02
+  outcome: 0
+  provenance: Colombian peace agreement plebiscite, 2 October 2016 (No 50.2%).
+
+- id: jcpoa-agreement-2015
+  question: Will Iran and the P5+1 conclude a comprehensive nuclear agreement by the end of July 2015?
+  resolution_criterion: YES if a final comprehensive agreement is formally announced by all parties.
+  domain: geopolitics
+  parties:
+    - United States
+    - Iran
+    - European Union
+    - Russia
+    - China
+    - Germany
+    - France
+    - United Kingdom
+  open_ts: 2013-11-24
+  cutoff_ts: 2015-04-02
+  resolved_at: 2015-07-14
+  outcome: 1
+  provenance: Joint Comprehensive Plan of Action announced in Vienna, 14 July 2015.
+
+- id: us-withdrawal-jcpoa-2018
+  question: Will the United States announce withdrawal from the JCPOA before the end of May 2018?
+  resolution_criterion: YES if the US President formally announces withdrawal and reimposition of sanctions.
+  domain: geopolitics
+  parties:
+    - United States
+    - Iran
+    - European Union
+    - France
+    - Germany
+    - United Kingdom
+  open_ts: 2017-01-20
+  cutoff_ts: 2018-01-12
+  resolved_at: 2018-05-08
+  outcome: 1
+  provenance: US presidential announcement of JCPOA withdrawal, 8 May 2018.
+
+- id: att-timewarner-doj-2018
+  question: Will the US Department of Justice succeed in blocking the AT&T-Time Warner merger?
+  resolution_criterion: >-
+    YES if a court enjoins the merger. NO if the court permits it to proceed.
+  domain: regulation
+  parties:
+    - AT&T
+    - Time Warner
+    - US Department of Justice
+    - US District Court for the District of Columbia
+    - Federal Communications Commission
+  open_ts: 2017-11-20
+  cutoff_ts: 2018-03-19
+  resolved_at: 2018-06-12
+  outcome: 0
+  provenance: US v. AT&T ruling permitting the merger, 12 June 2018.
+
+- id: microsoft-activision-2023
+  question: Will Microsoft complete its acquisition of Activision Blizzard before the end of 2023?
+  resolution_criterion: YES if the acquisition formally closes.
+  domain: regulation
+  parties:
+    - Microsoft
+    - Activision Blizzard
+    - UK Competition and Markets Authority
+    - US Federal Trade Commission
+    - European Commission
+    - Sony
+  open_ts: 2022-01-18
+  cutoff_ts: 2023-04-26
+  resolved_at: 2023-10-13
+  outcome: 1
+  provenance: Microsoft-Activision Blizzard acquisition closed 13 October 2023.
+
+- id: adobe-figma-2023
+  question: Will Adobe complete its acquisition of Figma?
+  resolution_criterion: YES if the acquisition closes; NO if it is abandoned or blocked.
+  domain: corporate
+  parties:
+    - Adobe
+    - Figma
+    - European Commission
+    - UK Competition and Markets Authority
+    - US Department of Justice
+  open_ts: 2022-09-15
+  cutoff_ts: 2023-08-01
+  resolved_at: 2023-12-18
+  outcome: 0
+  provenance: Adobe and Figma jointly terminated the merger agreement, 18 December 2023.
+
+- id: kroger-albertsons-2024
+  question: Will the Kroger-Albertsons merger be completed?
+  resolution_criterion: YES if the merger closes; NO if it is enjoined or abandoned.
+  domain: regulation
+  parties:
+    - Kroger
+    - Albertsons
+    - US Federal Trade Commission
+    - C&S Wholesale Grocers
+    - United Food and Commercial Workers
+  open_ts: 2022-10-14
+  cutoff_ts: 2024-08-26
+  resolved_at: 2024-12-11
+  outcome: 0
+  provenance: Court injunction 10 December 2024; Albertsons terminated the agreement 11 December 2024.
+
+- id: twitter-musk-acquisition-2022
+  question: Will Elon Musk complete the acquisition of Twitter before the end of 2022?
+  resolution_criterion: YES if the acquisition formally closes.
+  domain: corporate
+  parties:
+    - Elon Musk
+    - Twitter board
+    - Delaware Court of Chancery
+    - Twitter shareholders
+    - Financing banks
+  open_ts: 2022-04-14
+  cutoff_ts: 2022-07-08
+  resolved_at: 2022-10-27
+  outcome: 1
+  provenance: Twitter acquisition completed 27 October 2022 following Delaware litigation.
+
+- id: wga-amptp-2023
+  question: Will the Writers Guild of America and the AMPTP reach a tentative agreement before 31 October 2023?
+  resolution_criterion: YES if a tentative agreement is announced by both parties.
+  domain: labor
+  parties:
+    - Writers Guild of America
+    - AMPTP
+    - Netflix
+    - Walt Disney Company
+    - SAG-AFTRA
+  open_ts: 2023-05-02
+  cutoff_ts: 2023-07-15
+  resolved_at: 2023-09-24
+  outcome: 1
+  provenance: WGA-AMPTP tentative agreement announced 24 September 2023, ending the strike.
+
+- id: uaw-detroit-three-2023
+  question: Will the UAW reach tentative agreements with all three Detroit automakers before 15 November 2023?
+  resolution_criterion: YES if tentative agreements are announced with General Motors, Ford and Stellantis.
+  domain: labor
+  parties:
+    - United Auto Workers
+    - General Motors
+    - Ford Motor Company
+    - Stellantis
+    - White House
+  open_ts: 2023-09-15
+  cutoff_ts: 2023-09-25
+  resolved_at: 2023-10-30
+  outcome: 1
+  provenance: UAW tentative agreements with Ford (25 Oct), Stellantis (28 Oct) and GM (30 Oct) 2023.
+
+- id: usmca-signature-2018
+  question: Will the United States, Mexico and Canada sign a replacement for NAFTA before the end of 2018?
+  resolution_criterion: YES if all three governments sign the replacement agreement.
+  domain: geopolitics
+  parties:
+    - United States
+    - Mexico
+    - Canada
+    - US Congress
+    - Office of the United States Trade Representative
+  open_ts: 2017-08-16
+  cutoff_ts: 2018-06-01
+  resolved_at: 2018-11-30
+  outcome: 1
+  provenance: USMCA signed at the G20 summit in Buenos Aires, 30 November 2018.
+
+- id: nord-stream-2-certification-2022
+  question: Will Germany suspend certification of Nord Stream 2 before 31 March 2022?
+  resolution_criterion: YES if the German government formally halts the certification process.
+  domain: geopolitics
+  parties:
+    - Germany
+    - Russia
+    - Ukraine
+    - United States
+    - European Commission
+  open_ts: 2021-09-10
+  cutoff_ts: 2021-12-15
+  resolved_at: 2022-02-22
+  outcome: 1
+  provenance: German Chancellor halted Nord Stream 2 certification, 22 February 2022.
+
+- id: uk-eu-trade-agreement-2020
+  question: Will the United Kingdom and the European Union conclude a trade agreement before the end of the transition period?
+  resolution_criterion: YES if a trade agreement is agreed by negotiators before 31 December 2020.
+  domain: geopolitics
+  parties:
+    - United Kingdom
+    - European Commission
+    - France
+    - Ireland
+    - European Parliament
+  open_ts: 2020-03-02
+  cutoff_ts: 2020-10-15
+  resolved_at: 2020-12-24
+  outcome: 1
+  provenance: EU-UK Trade and Cooperation Agreement agreed 24 December 2020.
+
+- id: may-withdrawal-agreement-2019
+  question: Will the House of Commons approve the Withdrawal Agreement before 1 April 2019?
+  resolution_criterion: YES if the Commons passes a meaningful vote approving the agreement.
+  domain: regulation
+  parties:
+    - UK Government
+    - European Commission
+    - Democratic Unionist Party
+    - Conservative European Research Group
+    - Labour Party
+  open_ts: 2018-11-25
+  cutoff_ts: 2019-01-05
+  resolved_at: 2019-03-29
+  outcome: 0
+  provenance: Withdrawal Agreement defeated in the Commons on 15 January, 12 March and 29 March 2019.

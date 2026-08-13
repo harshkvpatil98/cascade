@@ -1,0 +1,22 @@
+# Secrets and machine-local settings
+.env
+
+# Generated study state
+.cache/
+.checkpoints/
+graphs/
+reports/study_*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store

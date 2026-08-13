@@ -1,0 +1,19 @@
+# Ablation cell C09 (spec Appendix C).
+#
+# LOO decomposition; multi-agent baseline
+#
+# decomposition=off | asymmetry=off | grounding=chronofence | D=200
+#
+# `ensemble.replicates` below carries the Appendix C **design** factor D. The
+# budget cap for the 11 non-headline cells is `ensemble.ablation_replicates`
+# (30) in configs/base.yaml. These are not the same number and the M7 grid
+# driver must state in the report which one it applied -- see CLAUDE.md Q1.
+# Do not silently reconcile them here.
+
+flags:
+  causal_decomposition: false
+  information_asymmetry: false
+  grounding: chronofence
+
+ensemble:
+  replicates: 200

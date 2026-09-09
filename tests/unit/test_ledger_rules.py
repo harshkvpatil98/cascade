@@ -293,3 +293,88 @@ def test_a_scenario_carries_no_outcome_field() -> None:
     assert isinstance(outcome, ScenarioRecord)
     assert "outcome" not in outcome.scenario.model_dump()
     assert "outcome" in outcome.label.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Lexicon hygiene
+#
+# `named_parties` counts lexicon hits, so a careless entry manufactures
+# parties. These guard the lexicon itself rather than the code that reads it.
+# ---------------------------------------------------------------------------
+
+# Words that are institutions in one reading and ordinary English in another.
+# An entry matching one of these would fire on prose and invent a party.
+_AMBIGUOUS_WITH_PROSE = frozenset(
+    {
+        "Apple",  # allowed: the fruit is lowercase in prose
+        "Amazon",
+        "Meta",
+    }
+)
+
+_FORBIDDEN_IN_LEXICON = frozenset(
+    {"Shell", "Visa", "Target", "Delta", "United", "House", "Senate ", "Will", "May", "March"}
+)
+
+
+def test_lexicon_entries_are_unique() -> None:
+    """A duplicate would not break counting, but it hides an editing mistake."""
+    from cascade.ledger.taxonomy import _ACTOR_LEXICON
+
+    assert len(_ACTOR_LEXICON) == len(set(_ACTOR_LEXICON))
+
+
+def test_lexicon_excludes_words_that_are_ordinary_english() -> None:
+    """Bare "Shell", "Visa", "Target", "Delta" and "United" must stay out.
+
+    Each is a company *and* a common word. Matching them would manufacture a
+    party from prose -- the same class of defect as counting "YES" (ADR-0009).
+    """
+    from cascade.ledger.taxonomy import _ACTOR_LEXICON
+
+    offenders = sorted(set(_ACTOR_LEXICON) & _FORBIDDEN_IN_LEXICON)
+    assert offenders == [], f"ambiguous lexicon entries: {offenders}"
+
+
+def test_every_alias_target_is_itself_recognised() -> None:
+    """An alias pointing at a non-entry would canonicalise to a dangling name."""
+    from cascade.ledger.taxonomy import _ACTOR_ALIASES, _ACTOR_LEXICON
+
+    known = set(_ACTOR_LEXICON)
+    for source, target in _ACTOR_ALIASES:
+        assert source in known, f"alias source {source!r} is not in the lexicon"
+        assert target in known, f"alias target {target!r} is not in the lexicon"
+
+
+def test_aliases_collapse_to_a_single_party() -> None:
+    """Every alias pair must count as one actor, not two."""
+    from cascade.ledger.taxonomy import _ACTOR_ALIASES, extract_known_actors
+
+    for source, target in _ACTOR_ALIASES:
+        actors = extract_known_actors(f"Talks between {source} and {target} continue.")
+        assert len(actors) == 1, f"{source}/{target} counted as {actors}"
+
+
+def test_ordinary_prose_names_no_parties() -> None:
+    """The screen must not fire on text with no institutional actors at all."""
+    from cascade.ledger.taxonomy import extract_known_actors
+
+    for prose in (
+        "Will the Blaze Star go nova during Blazing Swan 2025?",
+        "Will Sean Combs be alive on Jan 1st 2025?",
+        "Will the review use more than five em dashes?",
+        "Will it rain on Tuesday in the valley?",
+    ):
+        assert extract_known_actors(prose) == (), prose
+
+
+def test_merger_review_questions_now_resolve_their_parties() -> None:
+    """Spec §3.1 names merger reviews; the lexicon must cover their actors."""
+    from cascade.ledger.taxonomy import extract_known_actors
+
+    actors = extract_known_actors(
+        "Will Microsoft complete its acquisition of Activision Blizzard "
+        "after review by the CMA and the FTC?"
+    )
+    assert len(actors) >= MIN_PARTIES
+    assert "Microsoft" in actors

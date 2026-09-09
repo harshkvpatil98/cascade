@@ -149,6 +149,8 @@ choices the spec left open.
 | 0007 | The cache key excludes `cache_control` markers, so prompt-cache tuning is a pure cost change and does not force a paid re-record | M0 |
 | 0008 | Constraint precedence when the pool cannot satisfy §3.1: eligibility > base rate > domain cap > **N**. Resolves Q2 | M1 |
 | 0009 | `named_parties` counts recognised institutional actors, not proper nouns; Metaculus now needs a token and is reported, never absorbed | M1 |
+| 0010 | Corpus dates are read from the document, never the crawl; Wikipedia is anchored per-scenario; a bounded window replaces a DEFAULT partition | M2 |
+| 0011 | The 512-token chunk cap is verified per chunk, not estimated -- sentence, then word, then character splitting | M2 |
 
 ---
 
@@ -255,56 +257,68 @@ Deferred, with reasons:
   (the arbiter, Chronofence) land at M5 and M3; a property test with nothing to
   quantify over would be scaffolding, which §"anti-patterns" rules out.
 
-### M1 — Scenario registry · *blocked on source availability, 3 of 4 criteria met*
+### M1 — Scenario registry · *complete*
 
 Shipped: migration 002 (`scenarios` / `scenario_labels` / `scenario_manifest`
 with the invariant-2 grants); `cascade/ledger/` — four loaders, a
 content-addressed source cache, pure `rules.py` / `select.py` / `manifest.py` /
 `climatology.py` / `taxonomy.py`; `data/curated/historical.yaml` (16 entries
 against a fixed template); `cascade ledger build|seal|verify|status`;
-ADR-0008 and ADR-0009. Source cache: 212 MB, 20,049 raw candidates.
+ADR-0008 and ADR-0009. Source cache: 2.9 GB, 52,763 raw candidates.
 
-**Measured acceptance values** (3 of 4 met; 1 blocked on the source pool):
+**Measured acceptance values — 4 of 4 met.**
 
 | # | Criterion | Measured | Verdict |
 |---|---|---|---|
-| 1 | Exactly 180 scenarios; YES rate in [0.40, 0.60]; no domain > 25%; print the domain histogram | **57** scenarios; YES rate **0.4912**; max domain share **0.2456**; histogram printed across 11 domains. The rate and cap criteria pass; the count does not | **BLOCKED** — see below |
-| 2 | `manifest.sha256` written; a test that mutates one label asserts the check fails | sha256 `b83d5e05…` sealed and re-verified. Mutation caught in both directions: a flipped label and a moved `cutoff_ts` each raise `ManifestMismatch`, on fixtures **and** on real stored rows. 14 tests | **PASS** |
-| 3 | Grant test: `cascade_sim` selecting from `scenario_labels` raises `InsufficientPrivilege` | `cascade_sim` → **InsufficientPrivilege** on `scenario_labels`, **57 rows** on `scenarios`; `cascade_eval` reads both. Enforced by the absence of a grant, not a REVOKE (ADR-0005). 9 tests | **PASS** |
-| 4 | Climatology Brier computed and stored | base rate **0.491228**, climatology Brier **0.249923**, stored in `scenario_manifest` with the split it describes. Asserted against the p(1−p) identity | **PASS** |
+| 1 | Exactly 180 scenarios; YES rate in [0.40, 0.60]; no domain > 25%; print the domain histogram | **180** scenarios; YES rate **0.5000**; max domain share **0.2500**; histogram printed across 11 domains | **PASS** |
+| 2 | `manifest.sha256` written; a test that mutates one label asserts the check fails | sha256 `30d9c61d…` sealed and re-verified. Mutation caught in both directions: a flipped label and a moved `cutoff_ts` each raise `ManifestMismatch`, on fixtures **and** on real stored rows. 14 tests | **PASS** |
+| 3 | Grant test: `cascade_sim` selecting from `scenario_labels` raises `InsufficientPrivilege` | `cascade_sim` → **InsufficientPrivilege** on `scenario_labels`, **180 rows** on `scenarios`; `cascade_eval` reads both. Enforced by the absence of a grant, not a REVOKE (ADR-0005) | **PASS** |
+| 4 | Climatology Brier computed and stored | base rate **0.500000**, climatology Brier **0.250000**, stored in `scenario_manifest` with the split it describes. Asserted against the p(1−p) identity | **PASS** |
 
-CI: ruff clean, black clean, mypy strict clean (**35 files**), **290 unit +
-26 integration = 316 tests**. Scale: 5,182 lines in `cascade/` (35 modules),
-3,898 lines of tests.
+Composition: party rules — `event_siblings` 153, `named_parties` 18,
+`curated` 9. Sources — polymarket 164, manifold 7, curated 9. Pool: 34,613
+Polymarket + 18,134 Manifold + 16 curated raw candidates; rejections
+low_volume 22,262, insufficient_parties 7,448, horizon_too_short 18,564,
+single_quantity 2,985. Cutoffs span 2018-01-12 → 2026-09-01.
 
-**Criterion 1 blocker — the pool, not the algorithm.** Two independent causes,
-both documented with measurements:
+**How the earlier 57-scenario shortfall was cleared.** Two fixes, no rule
+relaxed:
 
-1. **Metaculus, the spec's primary source (~90 of 180), is gone.** Its API now
-   rejects unauthenticated requests. The loader is written and tested and
-   activates on `CASCADE_METACULUS_TOKEN`; it is reported as unavailable, never
-   absorbed (ADR-0009).
-2. **The ≥3-party rule, enforced correctly, is expensive.** An earlier
-   proper-noun count yielded 180 — and admitted "will the Blaze Star go nova",
-   "will Diddy be alive", "will the NYT review use >5 em dashes": three
-   capitalised tokens, zero parties. 95 of 163 scenarios had entered that way.
-   Restricting to recognised institutional actors took the set to 57. Two
-   narrower defects were found the same way: the proper-noun pattern joined
-   names across "and" (phantom third party) and the stop-word list was
-   case-sensitive, so "YES" — which opens nearly every resolution criterion —
-   counted as a party.
+1. **Polymarket keyset pagination.** The offset endpoint refuses offsets past
+   ~2,000, which capped the reachable archive at ~1,900 questions — and since
+   the ≥3-party rule is carried mostly by Polymarket's event structure, that
+   cap *was* the binding constraint on the whole set. The cursor parameter is
+   `after_cursor`, taken from the service's own `/openapi.json` rather than
+   guessed. Raw Polymarket candidates went 1,908 → **34,613**.
+2. **The actor lexicon was extended to corporations and competition
+   regulators** (96 → 241 entries). It previously held states and regulators
+   but almost no companies, which excluded exactly the merger-review and
+   corporate-event episodes §3.1 asks for.
 
-**The 180 is not reachable by relaxing a rule, and was not.** Per ADR-0008 the
-count gives and everything else holds. The diagnosed paths to a larger set, in
-order of expected yield: a Metaculus token; extending the actor lexicon to
-corporations and competition regulators (it covers states and regulators but
-almost no companies, which under-serves the "merger reviews" §3.1 asks for);
-deeper Polymarket pagination (offset caps at ~2,000 events and the documented
-`/events/keyset` cursor did not advance under any parameter name tried);
-more curated entries.
+**Metaculus remains unavailable** and is reported, never absorbed: its API
+rejects unauthenticated requests, and the loader activates on
+`CASCADE_METACULUS_TOKEN`. The set is therefore sourced from Polymarket,
+Manifold and the curated file — a documented deviation from §3.1's
+"~90 from Metaculus".
 
-**Do not start M2 until the set is complete** — the corpus is built against
-scenario cutoffs, so a registry that grows later invalidates the ingest.
+**Defects found and fixed at M1** (each has a regression test):
+
+- `named_parties` counted **proper nouns, not parties** — admitting "will the
+  Blaze Star go nova", "will Diddy be alive", "will the NYT review use >5 em
+  dashes". 95 of 163 scenarios had entered that way. Now restricted to
+  recognised institutional actors, failing closed (ADR-0009).
+- The proper-noun pattern joined names across "and", turning *"Russia and
+  Ukraine"* into a phantom **third** party.
+- The stop-word list was case-sensitive, so **"YES"** — which opens nearly
+  every market resolution criterion — counted as a party, inflating every
+  market question by one.
+- Nested names were collapsed *after* aliasing, so "European Parliament" and
+  "Parliament" counted as two parties for one body. Collapsing now happens on
+  the raw names, before aliases.
+- The Polymarket pagination boundary was never recorded, so the next cached
+  build asked for a page that was never stored, read the resulting
+  `SourceOffline` as "source unreachable", and silently dropped **every**
+  Polymarket scenario.
 
 Additional decisions recorded at M1:
 - **One scenario per real-world event.** A Polymarket event carries one market
@@ -320,3 +334,98 @@ Additional decisions recorded at M1:
 - `canonical_json` moved to `cascade/canonical.py`: the LLM cache key, the
   manifest hash and (at M8) the event-log hash must agree on bytes, so there is
   one definition.
+
+### M2 — Evidence corpus · *pipeline complete, chunk target not reached*
+
+Shipped: migration 003 (`documents` / `chunks` partitioned quarterly per
+ADR-0004, `corpus_ingest_state`, no DEFAULT partition); `cascade/corpus/` —
+five source adapters, pure `normalize.py` / `chunker.py` / `simhash.py`,
+`embed.py` on the pinned `BAAI/bge-small-en-v1.5`, COPY-based `store.py`,
+resumable `pipeline.py`; `cascade corpus build|status|verify`; ADR-0010 and
+ADR-0011.
+
+**Measured acceptance values** (3 of 4 met; 1 short on volume, not correctness):
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | ≥ 1,300,000 chunks; exact count and per-source breakdown | **107,835** chunks from **22,173** documents — ccnews 94,011 / govpr 6,158 / wikipedia 6,280 / edgar 1,386 / gdelt 0. Breakdown printed by `corpus status` | **SHORT** — see below |
+| 2 | Zero NULL, future or naive `published_at`, asserted over the full table | **0** NULL, **0** future, over all 22,173 rows (unqualified aggregates, never a sample). Naive dates are rejected before insert and counted as `naive_date` drops | **PASS** |
+| 3 | 100% embedding coverage (`COUNT(*) WHERE embedding IS NULL` = 0) | **0** chunks without a vector; coverage **1.0000** | **PASS** |
+| 4 | Dedupe collapse ratio reported; earliest-date retention verified on a fixture | Collapse ratio reported per run (measured **0.0191** on a single WARC file, 791 collapsed on a six-file unit). Earliest-date retention asserted in both arrival orders on a hand-built fixture, plus cross-batch and seeded-index cases | **PASS** |
+
+Chunk quality: mean **413.6** tokens, max **512** — the cap holds over every
+stored row. Date range 2015-01-08 → 2026-07-19. CI: ruff clean, black clean,
+mypy strict clean (**49 files**), **432 unit + 43 integration = 475 tests**.
+
+**Criterion 1 — throughput, not correctness.** Every invariant holds at the
+measured scale; the shortfall is wall-clock. Measured end-to-end throughput is
+**~93 chunks/s** (single WARC stream: 51 chunks/s; six parallel streams:
+93 chunks/s, CPU-bound at ~50%), so 1.3M chunks is roughly **4 hours** of
+continuous ingest. The pipeline is resumable per unit — `corpus_ingest_state`
+skips completed units, verified as 40 units skipped on a re-run — so reaching
+the target is a matter of running `cascade corpus build` until it does.
+`cascade corpus verify` exits **3** while short, so the gap cannot be mistaken
+for success.
+
+**GDELT contributed zero.** The adapter is written and was verified returning
+articles earlier in the session. GDELT enforces one request per five seconds;
+an early retry burst from this client — backoff started at 1 s, below GDELT's
+own floor — earned an IP-level throttle that outlasted the run, and it now
+answers 429 even at 20-second intervals. The backoff bug is fixed (retries now
+never wait less than the source's own interval, and honour `Retry-After`); the
+three units are recorded `failed`, and since only `done` units are skipped they
+retry automatically on the next run.
+
+**Defects found and fixed at M2** (each has a regression test):
+
+- **Chunks exceeded the 512-token cap in three distinct ways**, all measured in
+  real data. Overlap carried an oversized sentence into the next chunk
+  (**1,022** tokens); summed per-sentence estimates understate the joined
+  string; and word-splitting cannot divide text with no spaces — Japanese prose
+  and a minified JSON blob reached **2,125** tokens. The cap is now *verified*
+  per chunk, splitting at sentence, then word, then character boundaries
+  (ADR-0011). Two documents written before the fix were purged.
+- **The hard-split path was quadratic**: it re-measured the growing prefix
+  after every word, and SEC filings routinely contain single "sentences" of
+  thousands of words. Each word is now measured once.
+- **NUL bytes aborted the COPY of an entire batch.** Scraped HTML and SGML
+  filings carry them routinely; control characters are now stripped at the one
+  funnel every document passes through.
+- **Out-of-window dates aborted a batch too.** CC-NEWS re-crawls archive pages,
+  so a 2016 crawl yielded a 2013 article, and with no DEFAULT partition
+  (deliberately — it could never be pruned) it had nowhere to go. There is now
+  an explicit corpus window, asserted against the DDL by an integration test.
+- **Unsorted iteration in the pipeline** (invariant 7) — caught by the static
+  invariant test, not by review.
+- **SEC EDGAR returns 403** to any User-Agent without a contact address; a
+  blocked client looks exactly like a source with no documents. The agent is
+  now configurable via `corpus.contact`.
+- **CC-NEWS months before 2016-08 do not exist**; generating them turned a
+  known gap into a stream of fetch failures.
+
+Improvements beyond the roadmap, implemented rather than suggested:
+
+- **Parallel WARC streaming.** Single-stream ingest ran at 26% CPU — almost all
+  wall time waiting on a ~1 GB download. Files are independent, so they stream
+  concurrently: 51 → 93 chunks/s.
+- **Batched tokenization.** Per-sentence tokenizer calls dominated ingest CPU;
+  the fast tokenizer batches them into one call per document. 28.1 → 20.6 ms
+  per document.
+- **Bounded write batches.** A CC-NEWS month can hold ~100k chunks; they are
+  now flushed in configurable batches so memory is bounded and progress is
+  durable within a unit.
+- **Per-source politeness budgets.** Each source gets its own `Fetcher`, so
+  GDELT's five-second floor cannot throttle EDGAR and EDGAR's retries cannot
+  spend GDELT's allowance.
+- **`corpus_stats` reads the denormalised `n_chunks`** rather than joining two
+  partitioned tables on a non-partition key, which at corpus scale degenerates
+  into a full scan of both.
+
+Deferred, with reasons:
+- **CC-News via HuggingFace `datasets`** — the pinned stack has no such
+  dependency, and adding one is a substitution requiring an ADR. The Common
+  Crawl WARC path is parsed with the standard library instead and needs no new
+  dependency.
+- **IVFFlat indexes over the vectors** → M3. Index build is part of the
+  Chronofence latency work (§4.2) and wants the final row counts; building one
+  now would only have to be rebuilt.

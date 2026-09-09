@@ -75,44 +75,31 @@ def is_single_quantity(text: str) -> bool:
 # states and blocs rather than individuals: an individual is usually acting for
 # one of these, and counting both would double-count one party.
 _ACTOR_LEXICON: tuple[str, ...] = (
+    # -- States, blocs and IGOs ---------------------------------------------
     "African Union",
+    "Arab League",
     "Argentina",
+    "ASEAN",
     "Australia",
     "Austria",
-    "Bank of England",
-    "Bank of Japan",
     "Belgium",
-    "BRICS",
     "Brazil",
+    "BRICS",
     "Canada",
     "Chile",
     "China",
     "Colombia",
-    "Congress",
-    "DOJ",
-    "Democrats",
     "Denmark",
-    "ECB",
-    "EU",
     "Egypt",
-    "European Central Bank",
-    "European Commission",
+    "Ethiopia",
     "European Union",
-    "FDA",
-    "FTC",
-    "Federal Reserve",
     "Finland",
     "France",
-    "GOP",
+    "G7",
+    "G20",
     "Germany",
     "Greece",
-    "Hamas",
-    "Hezbollah",
-    "House",
-    "Houthis",
-    "IAEA",
-    "ICC",
-    "IMF",
+    "Hungary",
     "India",
     "Indonesia",
     "Iran",
@@ -121,35 +108,33 @@ _ACTOR_LEXICON: tuple[str, ...] = (
     "Israel",
     "Italy",
     "Japan",
-    "Kremlin",
+    "Kenya",
     "Lebanon",
+    "Libya",
     "Mexico",
     "NATO",
-    "NHS",
     "Netherlands",
+    "New Zealand",
     "Nigeria",
     "North Korea",
     "Norway",
+    "OECD",
     "OPEC",
-    "Ofcom",
     "Pakistan",
     "Palestine",
-    "Parliament",
-    "Pentagon",
     "Philippines",
     "Poland",
     "Portugal",
     "Qatar",
-    "Republicans",
+    "Romania",
     "Russia",
-    "SEC",
     "Saudi Arabia",
-    "Senate",
     "Serbia",
     "Singapore",
     "South Africa",
     "South Korea",
     "Spain",
+    "Sudan",
     "Sweden",
     "Switzerland",
     "Syria",
@@ -157,20 +142,202 @@ _ACTOR_LEXICON: tuple[str, ...] = (
     "Thailand",
     "Turkey",
     "UAE",
-    "UK",
-    "UN",
-    "US",
-    "USA",
     "Ukraine",
     "United Kingdom",
     "United Nations",
     "United States",
+    "UNESCO",
+    "UNHCR",
     "Venezuela",
     "Vietnam",
+    "World Bank",
     "WHO",
     "WTO",
-    "White House",
     "Yemen",
+    # Aliases and organs, collapsed to their principal by _ACTOR_ALIASES.
+    "EU",
+    "GOP",
+    "Kremlin",
+    "Pentagon",
+    "UK",
+    "UN",
+    "US",
+    "USA",
+    "White House",
+    "European Commission",
+    "European Parliament",
+    # -- Legislatures, courts and executive bodies ---------------------------
+    # Bare "Parliament" is deliberately absent: it is generic across every
+    # parliamentary system, and it nests inside "European Parliament", which
+    # made one body count as two parties. Named chambers only.
+    "Congress",
+    "Duma",
+    "House of Commons",
+    "House of Lords",
+    "Knesset",
+    "Senate",
+    "Supreme Court",
+    "European Court of Justice",
+    "International Court of Justice",
+    "ICC",
+    "ICJ",
+    # -- Regulators and agencies ---------------------------------------------
+    # Merger reviews are named scenarios in spec 3.1, so competition
+    # authorities are first-class actors here rather than background.
+    "ACCC",
+    "Bundeskartellamt",
+    "CFPB",
+    "CFTC",
+    "CMA",
+    "Competition and Markets Authority",
+    "DOJ",
+    "EPA",
+    "FAA",
+    "FCC",
+    "FDA",
+    "FERC",
+    "FTC",
+    "IAEA",
+    "NLRB",
+    "Ofcom",
+    "Ofgem",
+    "OSHA",
+    "SEC",
+    "USTR",
+    # -- Central banks --------------------------------------------------------
+    "Bank of England",
+    "Bank of Japan",
+    "Bank of Canada",
+    "ECB",
+    "European Central Bank",
+    "Federal Reserve",
+    "People's Bank of China",
+    "Reserve Bank of Australia",
+    "IMF",
+    # -- Political parties ----------------------------------------------------
+    "AfD",
+    "CDU",
+    "Conservative Party",
+    "Democrats",
+    "Fidesz",
+    "Labour Party",
+    "Liberal Democrats",
+    "Likud",
+    "Republicans",
+    "Scottish National Party",
+    "SPD",
+    # -- Organised armed actors ----------------------------------------------
+    "Al-Qaeda",
+    "Boko Haram",
+    "Hamas",
+    "Hezbollah",
+    "Houthis",
+    "ISIS",
+    "Islamic State",
+    "Taliban",
+    "Wagner Group",
+    # -- Labour organisations -------------------------------------------------
+    "AFL-CIO",
+    "SAG-AFTRA",
+    "Teamsters",
+    "UAW",
+    "United Auto Workers",
+    "United Food and Commercial Workers",
+    "Unite the Union",
+    "Writers Guild of America",
+    "WGA",
+    # -- Corporations ---------------------------------------------------------
+    # The lexicon previously held almost no companies, which excluded exactly
+    # the merger-review and corporate-event episodes 3.1 asks for. Entries are
+    # institutional names unlikely to collide with ordinary prose: bare
+    # "Shell", "Visa", "Target", "Delta" and "United" are deliberately absent
+    # because each is a common English word and would manufacture parties.
+    "Activision Blizzard",
+    "Adobe",
+    "Airbus",
+    "Albertsons",
+    "Alphabet",
+    "Amazon",
+    "American Airlines",
+    "Anthropic",
+    "Apple",
+    "Aramco",
+    "AstraZeneca",
+    "AT&T",
+    "Bank of America",
+    "Berkshire Hathaway",
+    "Binance",
+    "BlackRock",
+    "Boeing",
+    "ByteDance",
+    "Chevron",
+    "Citigroup",
+    "Coinbase",
+    "Comcast",
+    "Costco",
+    "Delta Air Lines",
+    "Disney",
+    "ExxonMobil",
+    "Facebook",
+    "Figma",
+    "Ford",
+    "Gazprom",
+    "General Motors",
+    "Goldman Sachs",
+    "Google",
+    "Huawei",
+    "Intel",
+    "JPMorgan",
+    "Kroger",
+    "Mastercard",
+    "Merck",
+    "Meta",
+    "Microsoft",
+    "Moderna",
+    "Morgan Stanley",
+    "Netflix",
+    "Nvidia",
+    "OpenAI",
+    "Oracle",
+    "Pfizer",
+    "Qualcomm",
+    "Samsung",
+    "Saudi Aramco",
+    "Siemens",
+    "Sony",
+    "SpaceX",
+    "Stellantis",
+    "Tesla",
+    "TikTok",
+    "TotalEnergies",
+    "Toyota",
+    "TSMC",
+    "T-Mobile",
+    "Twitter",
+    "Uber",
+    "United Airlines",
+    "Verizon",
+    "Volkswagen",
+    "Walmart",
+    "Wells Fargo",
+    # -- Space and science agencies -------------------------------------------
+    "CERN",
+    "ESA",
+    "NASA",
+    "Roscosmos",
+    # -- Sports governing bodies ----------------------------------------------
+    # Spec 3.1 admits "sports-adjacent strategic questions"; the governing
+    # body is the actor with objectives, not the team.
+    "FIFA",
+    "IOC",
+    "MLB",
+    "NBA",
+    "NCAA",
+    "NFL",
+    "NHL",
+    "Premier League",
+    "UEFA",
+    "UFC",
 )
 
 # Names that mean the same party. Collapsed before counting so that
@@ -184,10 +351,18 @@ _ACTOR_ALIASES: tuple[tuple[str, str], ...] = (
     ("UK", "United Kingdom"),
     ("EU", "European Union"),
     ("European Commission", "European Union"),
+    ("European Parliament", "European Union"),
     ("ECB", "European Central Bank"),
     ("UN", "United Nations"),
     ("Kremlin", "Russia"),
     ("GOP", "Republicans"),
+    ("ICJ", "International Court of Justice"),
+    ("CMA", "Competition and Markets Authority"),
+    ("UAW", "United Auto Workers"),
+    ("WGA", "Writers Guild of America"),
+    ("Alphabet", "Google"),
+    ("Facebook", "Meta"),
+    ("Aramco", "Saudi Aramco"),
 )
 
 _ALIAS_TARGET = dict(_ACTOR_ALIASES)
@@ -305,11 +480,8 @@ def extract_known_actors(text: str) -> tuple[str, ...]:
     protects the study's claim about what it is forecasting; recall is
     recoverable by extending the lexicon deliberately.
     """
-    found: set[str] = set()
-    for actor in _ACTOR_LEXICON:
-        if re.search(rf"\b{re.escape(actor)}\b", text):
-            found.add(_canonical(actor))
-    return tuple(sorted(_collapse_nested(found)))
+    found = {actor for actor in _ACTOR_LEXICON if re.search(rf"\b{re.escape(actor)}\b", text)}
+    return _canonicalise_all(found)
 
 
 def extract_parties(text: str) -> tuple[str, ...]:
@@ -325,12 +497,8 @@ def extract_parties(text: str) -> tuple[str, ...]:
     found: set[str] = set()
 
     for actor in _ACTOR_LEXICON:
-        # Word-boundary match so "US" does not fire inside "Australia" and
-        # "Iran" does not fire inside "Iranian"... which it should, but a
-        # substring match would also fire inside "Iraq"-adjacent noise. The
-        # adjectival forms are handled by the lexicon entries themselves.
         if re.search(rf"\b{re.escape(actor)}\b", text):
-            found.add(_canonical(actor))
+            found.add(actor)
 
     for match in _PROPER_NOUN.finditer(text):
         candidate = match.group(0).strip()
@@ -339,9 +507,21 @@ def extract_parties(text: str) -> tuple[str, ...]:
             continue
         if any(word.casefold() in _NOT_A_PARTY_FOLDED for word in words):
             continue
-        found.add(_canonical(candidate))
+        found.add(candidate)
 
-    return tuple(sorted(_collapse_nested(found)))
+    return _canonicalise_all(found)
+
+
+def _canonicalise_all(names: set[str]) -> tuple[str, ...]:
+    """Collapse nested names, then aliases, then sort.
+
+    Order matters and getting it wrong inflates the count. Nesting is a
+    property of the *written* names: "European Parliament" contains
+    "Parliament", but once the former is aliased to "European Union" the two
+    no longer look related and both survive as separate parties. So nesting is
+    resolved on the raw matches and aliasing happens afterwards.
+    """
+    return tuple(sorted({_canonical(name) for name in _collapse_nested(names)}))
 
 
 def _collapse_nested(names: set[str]) -> set[str]:

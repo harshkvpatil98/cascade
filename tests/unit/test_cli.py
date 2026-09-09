@@ -35,9 +35,9 @@ runner = CliRunner()
 CONSOLE_SCRIPT = Path(sys.executable).parent / "cascade"
 
 # Phases still to land. Each must refuse loudly rather than exit 0.
-# `ledger` left M0's stub list at M1 and is now a sub-app (build/seal/verify).
-DEFERRED_PHASES = ["corpus", "compile", "simulate", "evaluate", "trace", "report"]
-IMPLEMENTED_SUBAPPS = ["ledger", "db"]
+# `ledger` left the stub list at M1 and `corpus` at M2; both are now sub-apps.
+DEFERRED_PHASES = ["compile", "simulate", "evaluate", "trace", "report"]
+IMPLEMENTED_SUBAPPS = ["ledger", "corpus", "db"]
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +105,13 @@ def test_every_spec_subcommand_exists() -> None:
     result = runner.invoke(app, ["--help"])
     for phase in ["doctor", *DEFERRED_PHASES, *IMPLEMENTED_SUBAPPS]:
         assert phase in result.output
+
+
+def test_corpus_exposes_the_m2_lifecycle() -> None:
+    """build / status / verify are the three things a corpus operator needs."""
+    result = runner.invoke(app, ["corpus", "--help"])
+    for command in ("build", "status", "verify"):
+        assert command in result.output
 
 
 def test_ledger_exposes_the_m1_lifecycle() -> None:
@@ -285,5 +292,5 @@ def test_typer_exit_codes_survive_the_boundary(monkeypatch: pytest.MonkeyPatch) 
     """
     import cascade.cli as cli_module
 
-    monkeypatch.setattr(sys, "argv", ["cascade", "corpus"])
+    monkeypatch.setattr(sys, "argv", ["cascade", "compile"])
     assert cli_module.main() == EXIT_PRECONDITION

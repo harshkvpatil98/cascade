@@ -24,12 +24,17 @@ from datetime import UTC, datetime
 from hashlib import blake2b
 from typing import Any
 
-from cascade.ledger.http import SourceCache, SourceFetchError
+from cascade.ledger.http import SourceCache
 from cascade.ledger.schema import RawQuestion
 
-__all__ = ["EVENTS_URL", "load_polymarket", "parse_event"]
+__all__ = ["EVENTS_KEYSET_URL", "EVENTS_URL", "load_polymarket", "parse_event"]
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
+# Keyset pagination. The offset endpoint refuses offsets past ~2,000, which
+# caps it at roughly 2,000 events; this one walks the whole archive. The cursor
+# parameter is `after_cursor` -- taken from the service's own OpenAPI document
+# at /openapi.json rather than guessed.
+EVENTS_KEYSET_URL = "https://gamma-api.polymarket.com/events/keyset"
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -168,35 +173,43 @@ def load_polymarket(
     Ordered by volume because spec §3.1 asks for "non-trivial volume": a
     thinly traded market's resolution is less reliable, and its price carries
     little information about whether the outcome was genuinely unsettled.
+
+    Paginates by keyset cursor rather than offset. The offset endpoint rejects
+    offsets past ~2,000 with a 422, which capped the reachable archive at about
+    2,000 events -- and since the >= 3-party rule is carried mostly by
+    Polymarket's event structure, that cap was the binding constraint on the
+    whole scenario set. The keyset endpoint has no such ceiling.
     """
     out: list[RawQuestion] = []
-    for page in range(pages):
-        url = (
-            f"{EVENTS_URL}?limit={page_size}&offset={page * page_size}"
-            "&closed=true&order=volume&ascending=false"
-        )
-        try:
-            payload = cache.get_json(url)
-        except SourceFetchError as exc:
-            # Gamma rejects offsets past ~2,000 with a 422. That is the end of
-            # what offset pagination can reach, not a failure: stop cleanly so
-            # the build proceeds with what was retrieved. Any other fetch error
-            # is a real problem and still propagates.
-            if "offset too large" not in str(exc):
-                raise
-            # Record the boundary. Without this the next cached build asks for
-            # a page that was never stored, takes the resulting SourceOffline
-            # as "this source is unreachable", and silently drops every
-            # Polymarket scenario -- a 1,900-question hole that looks like a
-            # smaller pool rather than a bug.
-            cache.put_json(url, [])
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+
+    for _ in range(pages):
+        url = f"{EVENTS_KEYSET_URL}?limit={page_size}&closed=true&order=volume&ascending=false"
+        if cursor is not None:
+            url = f"{url}&after_cursor={cursor}"
+        payload = cache.get_json(url)
+        if not isinstance(payload, dict):
             break
-        if not isinstance(payload, list) or not payload:
+        events = payload.get("events")
+        if not isinstance(events, list) or not events:
             break
-        for event in payload:
+
+        for event in events:
             if not isinstance(event, dict):
                 continue
             question = parse_event(event, salt=salt)
             if question is not None:
                 out.append(question)
+
+        next_cursor = payload.get("next_cursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            break
+        # A cursor that repeats means the server stopped advancing; continuing
+        # would re-fetch the same page until `pages` is exhausted.
+        if next_cursor in seen_cursors:
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
     return out

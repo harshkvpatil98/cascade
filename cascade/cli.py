@@ -39,6 +39,10 @@ dev_app = typer.Typer(help="Self-test hooks. Not part of the study pipeline.", h
 app.add_typer(dev_app, name="dev")
 db_app = typer.Typer(help="Forward-only schema migrations.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+corpus_app = typer.Typer(
+    help="Build, inspect and verify the evidence corpus (M2).", no_args_is_help=True
+)
+app.add_typer(corpus_app, name="corpus")
 ledger_app = typer.Typer(
     help="Build, seal and verify the scenario registry (M1).", no_args_is_help=True
 )
@@ -229,12 +233,6 @@ def _not_yet(name: str, milestone: str) -> None:
 
 
 @app.command()
-def corpus(config: OverlayOpt = None) -> None:
-    """Ingest, dedupe, chunk and embed the evidence corpus (M2)."""
-    _not_yet("corpus", "M2")
-
-
-@app.command()
 def compile(config: OverlayOpt = None) -> None:
     """Compile scenarios into typed causal graphs (M4)."""
     _not_yet("compile", "M4")
@@ -323,6 +321,150 @@ def db_status(config: OverlayOpt = None) -> None:
             state = "[green]applied[/green]"
         table.add_row(migration.version, migration.name, state)
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# corpus: the evidence corpus (M2)
+# ---------------------------------------------------------------------------
+
+
+def _print_corpus_stats(stats: Any, target: int) -> None:
+    """Print measured corpus figures. Measured, never targeted."""
+    table = Table(title="Evidence corpus")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Required", justify="right")
+    table.add_column("", width=3)
+
+    def row(name: str, measured: str, required: str, ok: bool) -> None:
+        table.add_row(name, measured, required, "[green]OK[/green]" if ok else "[red]NO[/red]")
+
+    row("chunks", f"{stats.n_chunks:,}", f">= {target:,}", stats.n_chunks >= target)
+    row("documents", f"{stats.n_documents:,}", "-", True)
+    row("NULL published_at", str(stats.null_dates), "0", stats.null_dates == 0)
+    row("future published_at", str(stats.future_dates), "0", stats.future_dates == 0)
+    row(
+        "embedding coverage",
+        f"{stats.embedding_coverage:.4f}",
+        "1.0000",
+        stats.missing_embeddings == 0 and stats.n_chunks > 0,
+    )
+    console.print(table)
+
+    per_source = Table(title="Per-source breakdown")
+    per_source.add_column("Source", style="cyan")
+    per_source.add_column("documents", justify="right")
+    per_source.add_column("chunks", justify="right")
+    for name, documents, chunks in stats.per_source:
+        per_source.add_row(name, f"{documents:,}", f"{chunks:,}")
+    console.print(per_source)
+    console.print(f"date range: {stats.earliest} .. {stats.latest}")
+
+
+@corpus_app.command("build")
+def corpus_build(
+    config: OverlayOpt = None,
+    source: Annotated[
+        list[str] | None,
+        typer.Option("--source", help="Restrict to these sources. Repeatable."),
+    ] = None,
+    max_units: Annotated[
+        int | None,
+        typer.Option("--max-units", help="Cap units per source this run. Resumable."),
+    ] = None,
+) -> None:
+    """Ingest, dedupe, chunk and embed evidence (M2).
+
+    Resumable: units already recorded done are skipped, so an interrupted
+    ingest continues rather than restarting.
+    """
+    from datetime import UTC, datetime
+
+    from cascade.corpus.pipeline import run_ingest
+    from cascade.corpus.store import corpus_stats
+
+    settings = _settings(config)
+    selected = tuple(source) if source else None
+    report = run_ingest(
+        settings,
+        now=datetime.now(UTC),
+        sources=selected,
+        max_units_per_source=max_units,
+    )
+
+    table = Table(title="Ingest run")
+    table.add_column("Source", style="cyan")
+    table.add_column("units", justify="right")
+    table.add_column("skipped", justify="right")
+    table.add_column("failed", justify="right")
+    table.add_column("docs", justify="right")
+    table.add_column("chunks", justify="right")
+    table.add_column("collapsed", justify="right")
+    table.add_column("dropped", overflow="fold")
+    for source_report in report.sources:
+        dropped = ", ".join(
+            f"{reason}={count}" for reason, count in sorted(source_report.dropped.items())
+        )
+        table.add_row(
+            source_report.source,
+            str(source_report.units_done),
+            str(source_report.units_skipped),
+            str(source_report.units_failed),
+            f"{source_report.documents_written:,}",
+            f"{source_report.chunks_written:,}",
+            str(source_report.collapsed),
+            dropped or source_report.detail,
+        )
+    console.print(table)
+    console.print(
+        f"dedupe collapse ratio: [bold]{report.collapse_ratio:.4f}[/bold] "
+        f"({report.collapsed:,} collapsed of {report.collapsed + report.documents_written:,} kept+collapsed)"
+    )
+
+    stats = corpus_stats(settings)
+    _print_corpus_stats(stats, settings.corpus.target_chunks)
+
+
+@corpus_app.command("status")
+def corpus_status(config: OverlayOpt = None) -> None:
+    """Report measured corpus size, coverage and date integrity."""
+    from cascade.corpus.store import corpus_stats
+
+    settings = _settings(config)
+    _print_corpus_stats(corpus_stats(settings), settings.corpus.target_chunks)
+
+
+@corpus_app.command("verify")
+def corpus_verify(config: OverlayOpt = None) -> None:
+    """Assert the corpus invariants over the full table (spec §3.2).
+
+    Exits 3 on any violation. These are leakage invariants, so they are
+    asserted over every row rather than a sample: a sampled check on a
+    leakage rule is a check that can miss the row that matters.
+    """
+    from cascade.corpus.store import corpus_stats
+
+    settings = _settings(config)
+    stats = corpus_stats(settings)
+    _print_corpus_stats(stats, settings.corpus.target_chunks)
+
+    failures: list[str] = []
+    if stats.n_chunks == 0:
+        failures.append("corpus is empty")
+    if stats.null_dates:
+        failures.append(f"{stats.null_dates} documents have a NULL published_at")
+    if stats.future_dates:
+        failures.append(f"{stats.future_dates} documents are dated in the future")
+    if stats.missing_embeddings:
+        failures.append(f"{stats.missing_embeddings} chunks have no embedding")
+    if stats.n_chunks < settings.corpus.target_chunks:
+        failures.append(
+            f"{stats.n_chunks:,} chunks is short of the {settings.corpus.target_chunks:,} target"
+        )
+
+    if failures:
+        _fail("; ".join(failures), EXIT_PRECONDITION)
+    console.print("[bold green]corpus: all invariants hold[/bold green]")
 
 
 # ---------------------------------------------------------------------------

@@ -231,6 +231,30 @@ class LedgerConfig(_Model):
     metaculus_page_size: int
 
 
+class CorpusConfig(_Model):
+    """Evidence-corpus ingest settings (spec §3.2)."""
+
+    target_chunks: int
+    # SEC EDGAR requires a contact address in the User-Agent; see
+    # cascade/corpus/fetch.py. Put a real address here before a long ingest.
+    contact: str
+    start_year: int
+    end_year: int
+    chunk_max_tokens: int
+    chunk_overlap_tokens: int
+    embed_batch_size: int
+    min_body_chars: int
+    requests_per_second: float
+    max_documents_per_unit: int
+    write_batch_size: int
+    enabled_sources: tuple[str, ...]
+    gdelt_max_records: int
+    fetch_workers: int
+    ccnews_max_files: int
+    ccnews_max_records_per_file: int
+    wikipedia_max_articles_per_scenario: int
+
+
 class PathsConfig(_Model):
     checkpoints: str
     reports: str
@@ -282,6 +306,7 @@ class Settings(BaseSettings):
     flags: FlagsConfig
     llm: LLMConfig
     ledger: LedgerConfig
+    corpus: CorpusConfig
     database: DatabaseConfig
     langfuse: LangfuseConfig
     paths: PathsConfig

@@ -79,11 +79,15 @@ typecheck: ## mypy strict on cascade/
 
 .PHONY: test
 test: ## Run the test suite (excludes tests needing live services)
-	$(RUN) pytest -m "not integration and not network"
+	$(RUN) pytest -m "not integration and not network and not leakage"
 
 .PHONY: test-all
-test-all: ## Run every test including integration (requires `make up`)
+test-all: ## Run every test including integration and leakage (requires `make up`)
 	$(RUN) pytest -m "not network"
+
+.PHONY: test-leakage
+test-leakage: ## The M3 time-lock probes alone (requires `make up` and a built corpus)
+	$(RUN) pytest -m leakage
 
 .PHONY: ci
 ci: lint typecheck test ## Everything CI runs

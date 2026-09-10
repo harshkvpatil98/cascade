@@ -47,6 +47,11 @@ ledger_app = typer.Typer(
     help="Build, seal and verify the scenario registry (M1).", no_args_is_help=True
 )
 app.add_typer(ledger_app, name="ledger")
+retrieval_app = typer.Typer(
+    help="Chronofence: index, benchmark and verify time-locked retrieval (M3).",
+    no_args_is_help=True,
+)
+app.add_typer(retrieval_app, name="retrieval")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -690,6 +695,341 @@ def ledger_status(config: OverlayOpt = None) -> None:
         table.add_row("resolved-YES rate", f"{sealed.yes_rate:.4f}")
         table.add_row("climatology Brier", f"{sealed.climatology_brier:.6f}")
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# retrieval: Chronofence (M3)
+# ---------------------------------------------------------------------------
+
+
+def _print_index_report(report: Any) -> None:
+    """Print what the index pass did, per partition."""
+    table = Table(title="IVFFlat index pass")
+    table.add_column("Partition", style="cyan")
+    table.add_column("rows", justify="right")
+    table.add_column("lists", justify="right")
+    table.add_column("target", justify="right")
+    table.add_column("action")
+    table.add_column("reason", overflow="fold")
+    colour = {
+        "create": "green",
+        "rebuild": "yellow",
+        "keep": "dim",
+        "skip-empty": "dim",
+    }
+    for plan in report.plans:
+        style = colour.get(plan.action, "")
+        table.add_row(
+            plan.partition,
+            f"{plan.rows:,}",
+            "-" if plan.current_lists is None else str(plan.current_lists),
+            "-" if plan.target_lists == 0 else str(plan.target_lists),
+            f"[{style}]{plan.action}[/{style}]" if style else plan.action,
+            plan.reason,
+        )
+    console.print(table)
+    console.print(
+        f"created [bold]{report.created}[/bold] · rebuilt [bold]{report.rebuilt}[/bold] · "
+        f"kept [bold]{report.kept}[/bold] · skipped empty [bold]{report.skipped_empty}[/bold] "
+        f"in {report.elapsed_s:.1f}s"
+    )
+
+
+@retrieval_app.command("index")
+def retrieval_index(
+    config: OverlayOpt = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the plan without touching any index."),
+    ] = False,
+) -> None:
+    """Create or rebuild one IVFFlat index per non-empty chunks partition.
+
+    Sized `lists = clamp(round(sqrt(rows)), 1, index_max_lists)` from exact
+    row counts (ADR-0012). Idempotent: a second run keeps everything already
+    within tolerance.
+    """
+    from cascade.retrieval.index import apply_plans, measure, plan_all
+    from cascade.retrieval.schema import IndexReport
+
+    settings = _settings(config)
+    retrieval = settings.retrieval
+
+    partitions = measure(settings)
+    plans = plan_all(
+        partitions,
+        max_lists=retrieval.index_max_lists,
+        tolerance=retrieval.index_rebuild_tolerance,
+    )
+
+    if dry_run:
+        _print_index_report(
+            IndexReport(
+                plans=plans,
+                created=sum(1 for plan in plans if plan.action == "create"),
+                rebuilt=sum(1 for plan in plans if plan.action == "rebuild"),
+                kept=sum(1 for plan in plans if plan.action == "keep"),
+                skipped_empty=sum(1 for plan in plans if plan.action == "skip-empty"),
+                elapsed_s=0.0,
+            )
+        )
+        console.print("[yellow]dry run: nothing was changed[/yellow]")
+        return
+
+    _print_index_report(apply_plans(settings, plans))
+
+
+def _print_bench_result(result: Any, settings: Settings) -> None:
+    """Print measured latency and recall. Measured, never targeted."""
+    target = settings.retrieval
+
+    table = Table(title="Chronofence bench")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Required", justify="right")
+    table.add_column("", width=3)
+
+    def row(name: str, measured: str, required: str, ok: bool) -> None:
+        table.add_row(name, measured, required, "[green]OK[/green]" if ok else "[red]NO[/red]")
+
+    row("queries", f"{result.queries:,}", "-", True)
+    row("ivfflat probes", str(result.probes), str(target.ivfflat_probes), True)
+    row("p50", f"{result.latency.p50:.2f} ms", "-", True)
+    row(
+        "p95",
+        f"{result.latency.p95:.2f} ms",
+        f"< {target.target_p95_ms:.0f} ms",
+        result.latency.p95 < target.target_p95_ms,
+    )
+    row("p99", f"{result.latency.p99:.2f} ms", "-", True)
+    row("min / max", f"{result.latency.minimum:.2f} / {result.latency.maximum:.2f} ms", "-", True)
+    row(
+        f"recall@{result.recall.k}",
+        f"{result.recall.mean:.4f}" if result.recall.measured else "not measured",
+        f"> {target.target_recall_at_k:.2f}",
+        result.recall.measured and result.recall.mean > target.target_recall_at_k,
+    )
+    row("recall sample", f"{result.recall.scored:,} queries", "-", True)
+    row("empty results", f"{result.empty_results:,}", "-", True)
+    console.print(table)
+
+    histogram = Table(title="Latency histogram (ms)")
+    histogram.add_column("Bucket", style="cyan", justify="right")
+    histogram.add_column("Count", justify="right")
+    histogram.add_column("Share", justify="right")
+    histogram.add_column("", overflow="crop")
+    total = max(1, result.latency.n)
+    for lower, upper, count in result.latency.histogram:
+        if count == 0:
+            continue
+        label = f"{lower:g}-{upper:g}" if upper != float("inf") else f">{lower:g}"
+        share = count / total
+        histogram.add_row(label, f"{count:,}", f"{share:6.2%}", "█" * round(share * 40))
+    console.print(histogram)
+
+    console.print(
+        f"cutoffs: [bold]{result.distinct_cutoffs}[/bold] distinct, "
+        f"{result.earliest_cutoff} .. {result.latest_cutoff}"
+    )
+    if result.recall.measured:
+        console.print(
+            f"recall detail: min {result.recall.minimum:.4f}, "
+            f"perfect on {result.recall.perfect:,}/{result.recall.scored:,}, "
+            f"{result.recall.empty_ground_truth:,} sampled queries had no admissible evidence"
+        )
+    console.print(f"bench wall time: {result.elapsed_s:.1f}s")
+
+
+@retrieval_app.command("bench")
+def retrieval_bench(
+    config: OverlayOpt = None,
+    queries: Annotated[
+        int | None,
+        typer.Option("--queries", help="Override the configured query count."),
+    ] = None,
+) -> None:
+    """Benchmark time-locked retrieval: p50/p95/p99 and recall@k (M3).
+
+    Exits 3 when a measured value misses its acceptance criterion, so a
+    regression cannot pass as success in CI.
+    """
+    from cascade.retrieval.bench import run_bench
+
+    settings = _settings(config)
+    result = run_bench(settings, count=queries)
+    _print_bench_result(result, settings)
+
+    passed, failures = result.meets(settings)
+    if not passed:
+        _fail("; ".join(failures), EXIT_PRECONDITION)
+    console.print("[bold green]chronofence: latency and recall criteria met[/bold green]")
+
+
+@retrieval_app.command("verify")
+def retrieval_verify(config: OverlayOpt = None) -> None:
+    """Assert the Chronofence preconditions hold (spec §4.2).
+
+    Checks the structural guarantees, not a sample of results: the deployed
+    function pins the configured probes, every non-empty partition carries a
+    correctly sized index, and `cascade_sim` cannot reach the corpus except
+    through `chronofence_search`. Exits 3 on any violation.
+    """
+    from cascade.retrieval.index import measure, plan_all
+    from cascade.retrieval.search import Chronofence
+
+    settings = _settings(config)
+    retrieval = settings.retrieval
+    failures: list[str] = []
+
+    with Chronofence(settings, role="admin") as fence:
+        deployed = fence.probes()
+    if deployed != retrieval.ivfflat_probes:
+        failures.append(
+            f"chronofence_search pins ivfflat.probes={deployed} but config says "
+            f"{retrieval.ivfflat_probes}; migrations are forward-only, so add a new "
+            "migration rather than editing 004"
+        )
+
+    partitions = measure(settings)
+    plans = plan_all(
+        partitions,
+        max_lists=retrieval.index_max_lists,
+        tolerance=retrieval.index_rebuild_tolerance,
+    )
+    stale = [plan for plan in plans if plan.action in {"create", "rebuild"}]
+
+    table = Table(title="Chronofence preconditions")
+    table.add_column("Check", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("", width=3)
+
+    def row(name: str, measured: str, ok: bool) -> None:
+        table.add_row(name, measured, "[green]OK[/green]" if ok else "[red]NO[/red]")
+
+    indexed = sum(1 for plan in plans if plan.action == "keep")
+    non_empty = sum(1 for plan in plans if plan.rows > 0)
+    row("ivfflat probes pinned", str(deployed), deployed == retrieval.ivfflat_probes)
+    row("non-empty partitions", str(non_empty), True)
+    row("correctly sized indexes", f"{indexed}/{non_empty}", not stale)
+
+    leak_ok, leak_detail = _sim_role_is_fenced(settings)
+    row("cascade_sim fenced from chunks", leak_detail, leak_ok)
+    console.print(table)
+
+    if stale:
+        failures.append(
+            f"{len(stale)} partition(s) need an index pass: "
+            + ", ".join(f"{plan.partition} ({plan.action})" for plan in stale[:6])
+            + ("..." if len(stale) > 6 else "")
+            + " -- run `cascade retrieval index`"
+        )
+    if not leak_ok:
+        failures.append(f"cascade_sim is not fenced from the corpus: {leak_detail}")
+
+    if failures:
+        _fail("; ".join(failures), EXIT_PRECONDITION)
+    console.print("[bold green]chronofence: all preconditions hold[/bold green]")
+
+
+@retrieval_app.command("memorization")
+def retrieval_memorization(
+    config: OverlayOpt = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Probe only the first N scenarios by id."),
+    ] = None,
+) -> None:
+    """Measure what the agent model already knows with no context (M3, spec §4.2).
+
+    The one leakage control that cannot be engineered away: Chronofence keeps
+    post-cutoff *documents* out of the context window, not post-cutoff *facts*
+    out of the weights. Reports the distribution; it never fails a threshold,
+    because there is no threshold to enforce -- the number is disclosed
+    alongside the headline metric.
+
+    Costs money in `record` mode. The `bench` phase ceiling applies.
+    """
+    from cascade.ledger.store import load_records
+    from cascade.retrieval.memorization import run_probe
+
+    settings = _settings(config)
+
+    # Checked here rather than left to the SDK: a probe that dies twenty
+    # scenarios in has already spent money, and the operator needs to know
+    # which variable to set before it starts, not after.
+    key = settings.anthropic_api_key
+    if settings.llm.mode != "replay" and (key is None or not key.get_secret_value().strip()):
+        _fail(
+            f"llm.mode={settings.llm.mode!r} needs CASCADE_ANTHROPIC_API_KEY, which is "
+            "unset or empty. Set it in .env, or run against a recorded cache with "
+            "CASCADE_LLM__MODE=replay",
+            EXIT_PRECONDITION,
+        )
+
+    records = load_records(settings, role="eval")
+    if not records:
+        _fail("scenario registry is empty; run `cascade ledger build` first", EXIT_PRECONDITION)
+    if limit is not None:
+        records = tuple(sorted(records, key=lambda item: item.scenario.scenario_id))[:limit]
+
+    report = run_probe(settings, records)
+
+    table = Table(title="Parametric probe (memorization)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_row("scenarios probed", f"{report.total:,}")
+    table.add_row("answers parsed", f"{report.scored:,}")
+    table.add_row("unparseable", f"{report.unparseable:,}")
+    table.add_row("mean confidence", f"{report.mean_confidence:.4f}")
+    table.add_row("median confidence", f"{report.median_confidence:.4f}")
+    table.add_row("probe Brier", "n/a" if report.brier is None else f"{report.brier:.6f}")
+    table.add_row("directionally correct", f"{report.directionally_correct:,}/{report.scored:,}")
+    table.add_row(
+        "confident (>=0.5) and correct", f"{report.confident_and_correct:,}/{report.scored:,}"
+    )
+    console.print(table)
+
+    deciles = Table(title="Confidence distribution")
+    deciles.add_column("Bucket", style="cyan", justify="right")
+    deciles.add_column("Scenarios", justify="right")
+    deciles.add_column("", overflow="crop")
+    for low, count in report.confidence_deciles:
+        share = count / max(1, report.scored)
+        deciles.add_row(f"{low:.1f}-{low + 0.1:.1f}", f"{count:,}", "█" * round(share * 40))
+    console.print(deciles)
+
+    if report.unparseable:
+        console.print(
+            f"[yellow]{report.unparseable} answers could not be parsed[/yellow] and are "
+            "excluded from every statistic above rather than scored as 0.5"
+        )
+    console.print(
+        "[dim]Measured and disclosed, never enforced: a high score is a fact about "
+        "the model, not a defect in the harness (spec §4.2).[/dim]"
+    )
+
+
+def _sim_role_is_fenced(settings: Settings) -> tuple[bool, str]:
+    """True when `cascade_sim` cannot SELECT the corpus tables directly.
+
+    The grant is the mechanism (invariant 2, ADR-0005), so this asserts the
+    mechanism rather than trusting that no code happens to issue the query.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(settings.database_url("sim"), connect_timeout=10) as conn:
+            for table in ("chunks", "documents"):
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(f"SELECT 1 FROM {table} LIMIT 1")  # noqa: S608
+                    except psycopg.errors.InsufficientPrivilege:
+                        conn.rollback()
+                        continue
+                    return False, f"cascade_sim can SELECT {table}"
+    except psycopg.OperationalError as exc:
+        return False, f"cannot connect as cascade_sim: {exc}"
+    return True, "denied on chunks and documents"
 
 
 # ---------------------------------------------------------------------------

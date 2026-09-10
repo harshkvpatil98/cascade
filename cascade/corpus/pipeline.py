@@ -262,7 +262,14 @@ def run_ingest(
         "ccnews": Fetcher(
             requests_per_second=corpus.requests_per_second, user_agent=corpus.contact
         ),
-        "gdelt": Fetcher(requests_per_second=GDELT_REQUESTS_PER_SECOND, user_agent=corpus.contact),
+        "gdelt": Fetcher(
+            requests_per_second=GDELT_REQUESTS_PER_SECOND,
+            user_agent=corpus.contact,
+            # GDELT serves refusals under 200 as readily as under 429. Without
+            # this the notice reaches the JSON parser and the unit dies with a
+            # parse error instead of backing off and retrying.
+            classify_body=gdelt.classify_body,
+        ),
         "web": Fetcher(
             requests_per_second=corpus.requests_per_second,
             user_agent=corpus.contact,

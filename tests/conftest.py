@@ -143,3 +143,81 @@ def forbidding_transport() -> httpx.Client:
         )
 
     return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+# ---------------------------------------------------------------------------
+# Live-database fixtures, shared by tests/leakage/ and tests/property/
+#
+# Session-scoped: loading the pinned embedding model dominates these suites and
+# there is no per-test state to isolate, because every probe that writes rolls
+# its transaction back.
+#
+# These deliberately set `CASCADE_ENV_FILE` through os.environ rather than
+# monkeypatch. The autouse fixture above detaches every test from the repo's
+# .env, which is right for unit tests and wrong for a probe whose entire
+# purpose is to run against the real database; a session-scoped fixture cannot
+# use a function-scoped monkeypatch to undo it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def live_settings() -> Settings:
+    """Real settings against the running database, or skip.
+
+    Session-scoped: the embedding model load dominates these tests and there
+    is no per-test state to isolate, since every probe rolls back.
+    """
+    import os
+
+    env_file = REPO_ROOT / ".env"
+    if not env_file.is_file():
+        pytest.skip("no .env; run `make env` first")
+    os.environ["CASCADE_ENV_FILE"] = str(env_file)
+    settings = Settings()
+    try:
+        import psycopg
+
+        with (
+            psycopg.connect(settings.database_url("admin"), connect_timeout=5) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute("SELECT to_regprocedure('chronofence_search(halfvec,timestamptz,int)')")
+            row = cur.fetchone()
+            if row is None or row[0] is None:
+                pytest.skip("chronofence_search is absent; run `cascade db migrate`")
+            cur.execute("SELECT count(*) FROM chunks")
+            count_row = cur.fetchone()
+            if count_row is None or count_row[0] == 0:
+                pytest.skip("corpus is empty; run `cascade corpus build`")
+    except pytest.skip.Exception:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- a skip needs its reason
+        pytest.skip(f"postgres not reachable: {type(exc).__name__}: {exc}")
+    return settings
+
+
+@pytest.fixture(scope="session")
+def records(live_settings: Settings) -> tuple[Any, ...]:
+    """All 180 scenarios with their labels. Read as ``eval`` (invariant 2)."""
+    from cascade.ledger.store import load_records
+
+    loaded = load_records(live_settings, role="eval")
+    if not loaded:
+        pytest.skip("scenario registry is empty; run `cascade ledger build`")
+    return loaded
+
+
+@pytest.fixture(scope="session")
+def embedder(live_settings: Settings) -> Any:
+    """The pinned embedding model, loaded once for the whole suite."""
+    from cascade.corpus.embed import Embedder, EmbeddingUnavailable
+
+    model = Embedder(
+        model_name=live_settings.models.embedding,
+        batch_size=live_settings.corpus.embed_batch_size,
+    )
+    try:
+        model.load()
+    except EmbeddingUnavailable as exc:
+        pytest.skip(str(exc))
+    return model

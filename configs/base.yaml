@@ -67,11 +67,44 @@ aperture:
 retrieval:
   k_agent: 6
   k_compiler: 60
-  ivfflat_probes: 10
+  # Must equal the `SET ivfflat.probes` pinned into chronofence_search by
+  # migration 007. An integration test asserts they agree; changing this
+  # requires a new migration, not an edit to an applied one.
+  #
+  # 40, not the spec's 10: quarterly partitioning fans one query across 36
+  # index scans and probes applies per scan, so the spec's single-index
+  # value measures recall@20 = 0.8331 against a > 0.92 criterion. See
+  # ADR-0013 for the full curve.
+  ivfflat_probes: 40
   target_p95_ms: 15
   # Monthly partitions over a 2016-2024 corpus mean a late-cutoff query fans
   # out across ~100 index scans. Quarterly is the starting point. See ADR-0004.
   partition_granularity: quarter
+
+  # -- IVFFlat index lifecycle (ADR-0012) ------------------------------------
+  # lists = clamp(round(sqrt(rows)), 1, index_max_lists). The cap keeps the
+  # build tractable on the skewed large partitions; sqrt(1.3M) is ~1140, so
+  # 2000 leaves headroom above the study target without being unbounded.
+  index_max_lists: 2000
+  # Rebuild when configured lists drifts from sqrt(rows) by more than this
+  # fraction. Rebuilding on every row would thrash a 130k-row partition; never
+  # rebuilding lets recall rot silently as the corpus grows.
+  index_rebuild_tolerance: 0.25
+
+  # -- Bench (spec §4.2) -----------------------------------------------------
+  bench_queries: 10000
+  bench_recall_k: 20
+  # Recall is measured against exhaustive search, which is orders of magnitude
+  # slower than the indexed path; 5% of the query set is the spec's sample.
+  bench_recall_sample: 0.05
+  target_recall_at_k: 0.92
+
+  # -- Leakage suite (spec §4.2) --------------------------------------------
+  poison_pill_count: 500
+  # Cosine similarity above which a retrieved chunk is flagged for review
+  # against its scenario's resolution text. Flagging is not failing: the
+  # signature scan reports a reviewed count, it does not silently drop rows.
+  signature_similarity_threshold: 0.80
 
 ensemble:
   replicates: 200

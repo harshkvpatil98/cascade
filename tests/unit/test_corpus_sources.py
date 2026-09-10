@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 import pytest
 
 from cascade.corpus.fetch import Fetcher, html_to_text
-from cascade.corpus.sources import ccnews, edgar, govpr, wikipedia
+from cascade.corpus.sources import ccnews, edgar, gdelt, govpr, wikipedia
 
 # ---------------------------------------------------------------------------
 # HTML extraction
@@ -276,3 +276,191 @@ def test_retry_after_is_capped() -> None:
 
     response = httpx.Response(429, headers={"Retry-After": "99999"})
     assert Fetcher(requests_per_second=10.0)._backoff(0, response) == pytest.approx(120.0)
+
+
+# ---------------------------------------------------------------------------
+# Throttle notices served with a success status
+#
+# Regression: GDELT answers a throttled client with its "limit requests to one
+# every 5 seconds" notice under **HTTP 200** as well as under 429. The 200 path
+# bypassed the retry branch entirely, so the notice reached `get_json`, failed
+# to parse, and the unit was recorded as `FetchError: ... returned non-JSON` --
+# a message that accuses this client's parser of a bug instead of reporting the
+# throttle that actually happened. All three GDELT units in the corpus failed
+# this way and contributed zero documents.
+# ---------------------------------------------------------------------------
+
+
+def test_gdelt_throttle_notice_under_http_200_is_detected() -> None:
+    """A success status is not proof of a usable body."""
+    import httpx
+
+    notice = (
+        "Please limit requests to one every 5 seconds or contact "
+        "kalev.leetaru5@gmail.com for larger queries."
+    )
+    assert gdelt.classify_body(httpx.Response(200, text=notice)) == "throttled"
+
+
+def test_gdelt_429_is_a_throttle_whatever_the_body() -> None:
+    import httpx
+
+    assert gdelt.classify_body(httpx.Response(429, text="")) == "throttled"
+
+
+def test_gdelt_json_payload_is_never_a_soft_failure() -> None:
+    """A real answer stays a real answer even when it is empty."""
+    import httpx
+
+    response = httpx.Response(
+        200, json={"articles": []}, headers={"content-type": "application/json"}
+    )
+    assert gdelt.classify_body(response) is None
+
+
+def test_gdelt_article_text_mentioning_rate_limits_is_not_a_refusal() -> None:
+    """Marker prose inside a valid JSON answer must not trip the classifier."""
+    import httpx
+
+    response = httpx.Response(
+        200,
+        json={"articles": [{"title": "Regulator to rate limit high-frequency trading"}]},
+        headers={"content-type": "application/json"},
+    )
+    assert gdelt.classify_body(response) is None
+
+
+def test_gdelt_json_without_a_json_content_type_is_still_an_answer() -> None:
+    """The body decides, not the header. GDELT often sends no content-type."""
+    import httpx
+
+    assert gdelt.classify_body(httpx.Response(200, text='{"articles": []}')) is None
+
+
+def test_gdelt_unrecognised_non_json_body_is_unusable_not_content() -> None:
+    """Regression: the case a marker whitelist missed.
+
+    Two of three failing units were recognised as throttled; the third
+    returned a 200 whose body matched no known phrase and was handed to the
+    JSON parser, which recorded the source's refusal as this client's parse
+    error. Anything that is not JSON is not an answer.
+    """
+    import httpx
+
+    page = "<html><body><h1>503 Service Unavailable</h1></body></html>"
+    assert gdelt.classify_body(httpx.Response(200, text=page)) == "unusable"
+
+
+def test_gdelt_empty_body_is_unusable() -> None:
+    import httpx
+
+    assert gdelt.classify_body(httpx.Response(200, text="")) == "unusable"
+
+
+def test_throttled_200_is_retried_and_then_raises_rate_limited(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The notice must drive backoff, not reach a parser as content."""
+    import httpx
+
+    from cascade.corpus.fetch import RateLimited
+
+    notice = "Please limit requests to one every 5 seconds."
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(200, text=notice)
+
+    slept: list[float] = []
+    monkeypatch.setattr("cascade.corpus.fetch.time.sleep", slept.append)
+
+    fetcher = Fetcher(
+        requests_per_second=0.2,
+        max_retries=3,
+        classify_body=gdelt.classify_body,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(RateLimited):
+        fetcher.get("https://api.gdeltproject.org/api/v2/doc/doc?query=x")
+
+    assert attempts["n"] == 3, "a throttled 200 must be retried, not accepted"
+    assert fetcher.throttled == 3
+    # `slept` holds both the rate limiter's pacing waits and the retry backoff.
+    # The invariant covering both is that nothing waits less than the source's
+    # own interval; the pacing wait is computed by subtraction, so it lands a
+    # float epsilon under 5.0 rather than exactly on it.
+    interval = 1.0 / 0.2
+    assert slept, "a throttled response must produce a wait"
+    assert all(wait >= interval - 1e-3 for wait in slept)
+    # The backoff waits specifically double the interval (see _backoff).
+    assert max(slept) == pytest.approx(interval * 2.0)
+
+
+def test_unusable_200_is_retried_and_names_the_body_not_the_parser(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The error must describe what arrived, not blame the JSON decoder."""
+    import httpx
+
+    from cascade.corpus.fetch import FetchError, RateLimited
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>nope</html>")
+
+    monkeypatch.setattr("cascade.corpus.fetch.time.sleep", lambda _seconds: None)
+
+    fetcher = Fetcher(
+        requests_per_second=0.2,
+        max_retries=2,
+        classify_body=gdelt.classify_body,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(FetchError) as caught:
+        fetcher.get_json("https://api.gdeltproject.org/x")
+
+    assert not isinstance(caught.value, RateLimited), "an HTML page is not a throttle"
+    assert "unusable body" in str(caught.value)
+    assert "non-JSON" not in str(caught.value)
+    assert fetcher.throttled == 0
+
+
+def test_a_recovering_source_returns_its_payload() -> None:
+    """Backoff must yield to the answer once the throttle lifts."""
+    import httpx
+
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(200, text="Please limit requests to one every 5 seconds.")
+        return httpx.Response(
+            200, json={"articles": []}, headers={"content-type": "application/json"}
+        )
+
+    fetcher = Fetcher(
+        requests_per_second=1000.0,
+        max_retries=3,
+        classify_body=gdelt.classify_body,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert fetcher.get_json("https://api.gdeltproject.org/x") == {"articles": []}
+    assert fetcher.throttled == 1
+
+
+def test_a_source_without_a_classifier_is_unaffected() -> None:
+    """Every other source keeps its previous behaviour: 200 means content."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="plain text body")
+
+    fetcher = Fetcher(
+        requests_per_second=1000.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert fetcher.get_text("https://example.gov/press-release") == "plain text body"
+
+
+def test_rate_limited_is_a_fetch_error() -> None:
+    """Existing `except FetchError` handlers must keep catching throttles."""
+    from cascade.corpus.fetch import FetchError, RateLimited
+
+    assert issubclass(RateLimited, FetchError)

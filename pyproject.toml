@@ -106,5 +106,9 @@ addopts = "-q --strict-markers"
 markers = [
     "integration: requires live Postgres/Langfuse (deselect with '-m \"not integration\"')",
     "network: makes real API calls and costs money (deselect by default)",
+    # Leakage probes write to the live corpus inside a transaction they roll
+    # back. Marked separately from `integration` because they are the study's
+    # validity checks rather than schema checks, and are reported as such.
+    "leakage: time-lock probes against the live corpus (spec §4.2)",
 ]
 filterwarnings = ["error::DeprecationWarning:cascade.*"]

@@ -17,13 +17,24 @@ User-Agent, and a blocked client looks exactly like an empty source.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
-__all__ = ["FetchError", "Fetcher", "html_to_text"]
+__all__ = ["FetchError", "Fetcher", "RateLimited", "SoftFailure", "html_to_text"]
+
+# Why a 2xx response is nevertheless not an answer.
+#
+# "throttled" -- the source is refusing because the client is asking too
+#   often. The same request succeeds later, so it is worth waiting for.
+# "unusable"  -- the source answered with something that is not the content
+#   type it was asked for: an HTML error page, a truncated body, a notice in
+#   prose. Also retried, because the alternative is handing it to a parser
+#   that will report the source's problem as this client's bug.
+SoftFailure = Literal["throttled", "unusable"]
 
 # SEC EDGAR rejects requests whose User-Agent does not carry a contact address
 # in "Name email@domain" form -- measured: a descriptive-but-address-free agent
@@ -66,6 +77,20 @@ _BLOCK_ELEMENTS = frozenset(
 
 class FetchError(RuntimeError):
     """A source returned something unusable."""
+
+
+class RateLimited(FetchError):
+    """A source refused the request because the client is asking too often.
+
+    Distinct from :class:`FetchError` because the two call for opposite
+    responses: an unusable payload is a fact about the resource and retrying
+    it wastes politeness budget, while a throttle is a fact about *timing* and
+    the same request will succeed later. Keeping them apart is also what makes
+    a throttled source distinguishable from an empty one in
+    ``corpus_ingest_state.detail`` -- measured: GDELT's notice was recorded as
+    ``returned non-JSON``, which reads as a broken parser rather than a source
+    that answered "slow down".
+    """
 
 
 class _TextExtractor(HTMLParser):
@@ -132,6 +157,16 @@ class Fetcher:
     client: httpx.Client | None = None
     requests: int = 0
     failures: int = 0
+    throttled: int = 0
+    # Classifies a 2xx response that is not actually an answer, returning None
+    # when it is one. Not every API signals refusal with a status code: GDELT
+    # serves its "limit requests to one every 5 seconds" notice under HTTP 200
+    # as readily as under 429, and the retry path below would otherwise hand
+    # the notice to a JSON parser and record the resulting parse error as the
+    # unit's cause of death. The hook lives here because backoff and politeness
+    # live here; what one source's refusal looks like stays in that source's
+    # module.
+    classify_body: Callable[[httpx.Response], SoftFailure | None] | None = None
     _last_request: float = field(default=0.0, init=False)
 
     def _http(self) -> httpx.Client:
@@ -182,6 +217,7 @@ class Fetcher:
         politeness budget that the rest of the ingest needs.
         """
         last: Exception | None = None
+        rate_limited = False
         for attempt in range(self.max_retries):
             self._throttle()
             self.requests += 1
@@ -192,16 +228,40 @@ class Fetcher:
                 last = exc
             else:
                 if response.status_code == 200:
-                    return response
-                if response.status_code in {429, 500, 502, 503, 504}:
-                    last = FetchError(f"HTTP {response.status_code} for {url}")
+                    # A success status is not proof of a usable body. Checked
+                    # before returning, so a refusal never reaches a parser
+                    # that will report it as malformed content.
+                    verdict = (
+                        self.classify_body(response) if self.classify_body is not None else None
+                    )
+                    if verdict is None:
+                        return response
+                    if verdict == "throttled":
+                        self.throttled += 1
+                        rate_limited = True
+                        last = RateLimited(f"rate-limit notice served as HTTP 200 for {url}")
+                    else:
+                        last = FetchError(
+                            f"HTTP 200 for {url} carried an unusable body "
+                            f"({response.headers.get('content-type') or 'no content-type'}, "
+                            f"{len(response.content)} bytes)"
+                        )
+                    throttled = response
+                elif response.status_code in {429, 500, 502, 503, 504}:
+                    rate_limited = response.status_code == 429
+                    last = (RateLimited if rate_limited else FetchError)(
+                        f"HTTP {response.status_code} for {url}"
+                    )
+                    if rate_limited:
+                        self.throttled += 1
                     throttled = response
                 else:
                     self.failures += 1
                     raise FetchError(f"HTTP {response.status_code} for {url}")
             time.sleep(self._backoff(attempt, throttled))
         self.failures += 1
-        raise FetchError(f"giving up on {url} after {self.max_retries} attempts: {last}")
+        failure = RateLimited if rate_limited else FetchError
+        raise failure(f"giving up on {url} after {self.max_retries} attempts: {last}")
 
     def get_json(self, url: str, *, headers: dict[str, str] | None = None) -> Any:
         response = self.get(url, headers=headers)

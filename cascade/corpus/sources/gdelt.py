@@ -8,9 +8,13 @@ publisher.
 Two consequences are handled here rather than discovered later:
 
 * GDELT enforces **one request per five seconds** and answers faster clients
-  with HTTP 429 and an explanatory body. The fetcher for this source is
-  configured at 0.2 requests/second; a source silently returning 429 looks
-  identical to a source with no articles.
+  with an explanatory notice. The fetcher for this source is configured at
+  0.2 requests/second. The notice arrives under HTTP 429 *and*, measured
+  against the live service, under **HTTP 200 with a plain-text body** -- so
+  the status code alone cannot be trusted to identify it, and a throttled
+  source that is not identified looks exactly like a source with no articles.
+  :func:`classify_body` closes that gap and is wired into this source's
+  fetcher by the pipeline.
 * Publisher fetches fail often -- paywalls, geo-blocks, dead links. A failed
   body is skipped, never substituted with the GDELT title, because a headline
   is not the evidence the corpus claims to hold.
@@ -25,12 +29,64 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
-from cascade.corpus.fetch import Fetcher, FetchError, html_to_text
+import httpx
+
+from cascade.corpus.fetch import Fetcher, FetchError, SoftFailure, html_to_text
 from cascade.corpus.schema import RawDocument
 
-__all__ = ["DOC_API_URL", "QUERIES", "load_window", "unit_keys"]
+__all__ = [
+    "DOC_API_URL",
+    "QUERIES",
+    "classify_body",
+    "load_window",
+    "unit_keys",
+]
 
 DOC_API_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+# Phrases from GDELT's refusal notices. Used only to *label* an unusable body
+# as a throttle rather than to decide whether it is unusable -- see
+# `classify_body` for why that distinction matters.
+_THROTTLE_MARKERS = (
+    "limit requests to one every",
+    "your query is too broad",
+    "rate limit",
+)
+
+
+def classify_body(response: httpx.Response) -> SoftFailure | None:
+    """Classify a GDELT 2xx body: ``None`` when it is a real answer.
+
+    Every request this module makes carries ``format=json``, so **a 200 whose
+    body is not JSON is not an answer**, whatever the reason. That is the test
+    applied here, and it is deliberately not a search for known error strings.
+
+    A marker whitelist was tried first and proved too narrow within one ingest
+    run: two of the three failing units were correctly identified as throttled,
+    while the third came back with a 200 carrying a body that matched no known
+    phrase and was recorded, once again, as ``returned non-JSON``. Enumerating
+    a third party's error prose is a losing game -- the shape of a *valid*
+    answer is the thing this client actually knows.
+
+    The markers survive only to distinguish "throttled" (worth waiting for)
+    from "unusable" (retried, but not evidence of impatience), because those
+    two mean different things in an ingest report.
+    """
+    if response.status_code == 429:
+        return "throttled"
+
+    try:
+        response.json()
+    except ValueError:
+        pass
+    else:
+        return None
+
+    head = response.text[:512].lower()
+    if any(marker in head for marker in _THROTTLE_MARKERS):
+        return "throttled"
+    return "unusable"
+
 
 # Broad strategic-affairs queries. Chosen to span the domains the scenario set
 # is stratified over (spec §3.1) rather than to match any individual question:

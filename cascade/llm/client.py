@@ -202,7 +202,13 @@ class LLMClient:
         import anthropic  # the single SDK import in the codebase (invariant 5)
 
         api_key = self._settings.anthropic_api_key
-        if api_key is None:
+        # An *empty* variable is not an absent one. `CASCADE_ANTHROPIC_API_KEY=`
+        # in a .env file parses to SecretStr("") rather than None, so a bare
+        # `is None` check passes it through to the SDK, which rejects it with
+        # `TypeError: Could not resolve authentication method` -- an error that
+        # names neither the variable nor this project. Measured on a checkout
+        # whose .env carried the key with no value.
+        if api_key is None or not api_key.get_secret_value().strip():
             raise LLMError(
                 f"CASCADE_ANTHROPIC_API_KEY is not set but llm.mode={self._mode!r} needs it. "
                 "Only replay runs without a key."

@@ -18,6 +18,15 @@ services:
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     ports:
       - "${CASCADE_DATABASE__PORT:-5433}:5432"
+    # Docker defaults /dev/shm to 64 MB. Postgres allocates the shared memory
+    # that parallel workers exchange tuples through from there, and
+    # `max_parallel_workers_per_gather=4` over the partitioned `chunks` table
+    # exceeds 64 MB well before the corpus reaches its target size. Measured:
+    # a parallel aggregate over 409,899 chunks failed with
+    # `DiskFull: could not resize shared memory segment ... No space left on
+    # device` while the host had 801 GB free -- a message that points at the
+    # disk and means the container's shm mount.
+    shm_size: 1gb
     volumes:
       - cascade-pgdata:/var/lib/postgresql/data
       - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro

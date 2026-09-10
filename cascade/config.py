@@ -164,6 +164,14 @@ class RetrievalConfig(_Model):
     ivfflat_probes: int
     target_p95_ms: float
     partition_granularity: Literal["month", "quarter"]
+    index_max_lists: int = Field(gt=0)
+    index_rebuild_tolerance: float = Field(gt=0.0)
+    bench_queries: int = Field(gt=0)
+    bench_recall_k: int = Field(gt=0)
+    bench_recall_sample: float = Field(gt=0.0, le=1.0)
+    target_recall_at_k: float = Field(gt=0.0, le=1.0)
+    poison_pill_count: int = Field(gt=0)
+    signature_similarity_threshold: float = Field(gt=0.0, le=1.0)
 
 
 class EnsembleConfig(_Model):

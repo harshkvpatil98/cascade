@@ -127,16 +127,22 @@ make up         # Postgres + Langfuse, waits for health
 make migrate    # forward-only SQL migrations
 make ci         # ruff + black + mypy strict + pytest
 make test       # pytest, excluding tests needing live services
-make test-all   # includes integration tests (needs `make up`)
+make test-all   # includes integration and leakage tests (needs `make up`)
+make test-leakage  # the M3 time-lock probes alone
 cascade doctor  # toolchain, pinned stack, service health
+
+cascade retrieval index    # (re)build one IVFFlat index per chunks partition
+cascade retrieval verify   # assert the Chronofence preconditions; exits 3 on drift
+cascade retrieval bench    # p50/p95/p99 + recall@20; exits 3 if a criterion is missed
+cascade retrieval memorization  # the parametric probe (costs money in record mode)
 ```
 
 ---
 
 ## 7. Architecture decisions
 
-Seven ADRs in `docs/adr/`. Five correct defects found in the spec; two record
-choices the spec left open.
+Thirteen ADRs in `docs/adr/`. Seven correct defects found in the spec; the rest
+record choices the spec left open.
 
 | ADR | Decision | Milestone |
 |---|---|---|
@@ -151,6 +157,8 @@ choices the spec left open.
 | 0009 | `named_parties` counts recognised institutional actors, not proper nouns; Metaculus now needs a token and is reported, never absorbed | M1 |
 | 0010 | Corpus dates are read from the document, never the crawl; Wikipedia is anchored per-scenario; a bounded window replaces a DEFAULT partition | M2 |
 | 0011 | The 512-token chunk cap is verified per chunk, not estimated -- sentence, then word, then character splitting | M2 |
+| 0012 | IVFFlat index lifecycle is an operational command, not a migration -- `lists ≈ sqrt(rows)` is a function of measured data, and an index built on an empty partition is permanently degenerate | M3 |
+| 0013 | `ivfflat.probes` is 40, not the spec's 10: quarterly partitioning fans one query across 36 index scans and probes applies per scan, so the single-index value measures recall@20 = 0.8331 against a > 0.92 criterion | M3 |
 
 ---
 
@@ -348,20 +356,24 @@ ADR-0011.
 
 | # | Criterion | Measured | Verdict |
 |---|---|---|---|
-| 1 | ≥ 1,300,000 chunks; exact count and per-source breakdown | **107,835** chunks from **22,173** documents — ccnews 94,011 / govpr 6,158 / wikipedia 6,280 / edgar 1,386 / gdelt 0. Breakdown printed by `corpus status` | **SHORT** — see below |
-| 2 | Zero NULL, future or naive `published_at`, asserted over the full table | **0** NULL, **0** future, over all 22,173 rows (unqualified aggregates, never a sample). Naive dates are rejected before insert and counted as `naive_date` drops | **PASS** |
+| 1 | ≥ 1,300,000 chunks; exact count and per-source breakdown | **409,899** chunks from **100,339** documents — ccnews 396,075 / wikipedia 6,280 / govpr 6,158 / edgar 1,386 / gdelt 0. Breakdown printed by `corpus status` | **SHORT** — see below |
+| 2 | Zero NULL, future or naive `published_at`, asserted over the full table | **0** NULL, **0** future, over all 100,339 rows (unqualified aggregates, never a sample). Naive dates are rejected before insert and counted as `naive_date` drops | **PASS** |
 | 3 | 100% embedding coverage (`COUNT(*) WHERE embedding IS NULL` = 0) | **0** chunks without a vector; coverage **1.0000** | **PASS** |
 | 4 | Dedupe collapse ratio reported; earliest-date retention verified on a fixture | Collapse ratio reported per run (measured **0.0191** on a single WARC file, 791 collapsed on a six-file unit). Earliest-date retention asserted in both arrival orders on a hand-built fixture, plus cross-batch and seeded-index cases | **PASS** |
 
 Chunk quality: mean **413.6** tokens, max **512** — the cap holds over every
 stored row. Date range 2015-01-08 → 2026-07-19. CI: ruff clean, black clean,
-mypy strict clean (**49 files**), **432 unit + 43 integration = 475 tests**.
+mypy strict clean (**49 files**). Test totals at the close of M2 were restated
+at M3 against a measured collection — see the M3 entry; the figure recorded
+here originally (475) did not match what pytest collects.
 
 **Criterion 1 — throughput, not correctness.** Every invariant holds at the
 measured scale; the shortfall is wall-clock. Measured end-to-end throughput is
 **~93 chunks/s** (single WARC stream: 51 chunks/s; six parallel streams:
 93 chunks/s, CPU-bound at ~50%), so 1.3M chunks is roughly **4 hours** of
-continuous ingest. The pipeline is resumable per unit — `corpus_ingest_state`
+continuous ingest. Ingest continued after this entry was first written and the
+corpus stands at **409,899 chunks / 100,339 documents** (31.5% of target); the
+counts above are the current measured values, not those of the original run. The pipeline is resumable per unit — `corpus_ingest_state`
 skips completed units, verified as 40 units skipped on a re-run — so reaching
 the target is a matter of running `cascade corpus build` until it does.
 `cascade corpus verify` exits **3** while short, so the gap cannot be mistaken
@@ -429,3 +441,120 @@ Deferred, with reasons:
 - **IVFFlat indexes over the vectors** → M3. Index build is part of the
   Chronofence latency work (§4.2) and wants the final row counts; building one
   now would only have to be rebuilt.
+
+### M3 — Chronofence · *complete, 4 of 5 acceptance criteria met*
+
+Shipped: migrations 004–007 (`chronofence_search` and `chronofence_search_exact`
+as SECURITY DEFINER with pinned `search_path` and `ivfflat.probes` per ADR-0002;
+the `chronofence_partitions` view; grants); `cascade/retrieval/` — pure
+`metrics.py` / `queries.py` / sizing in `index.py`, the `Chronofence` client,
+the 10,000-query `bench.py`, `leakage.py` and `memorization.py`;
+`cascade retrieval index|verify|bench|memorization`; the leakage suite in
+`tests/leakage/` and the date-monotonicity property test in `tests/property/`;
+ADR-0012 and ADR-0013.
+
+**Measured acceptance values — 4 of 5 met; 1 blocked on a credential.**
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | p95 < 15 ms over 10,000 queries; print the full histogram | **p95 13.43 ms** (p50 10.95, p99 14.60, min 8.52, max 45.63) over **10,000** queries spanning **180** distinct cutoffs, 2018-01-12 → 2026-07-19. Histogram printed: 13.60% under 10 ms, 72.59% in 10–12.5, 13.23% in 12.5–15, 0.58% above. **0** empty results | **PASS** |
+| 2 | recall@20 > 0.92 vs exact search | **0.9372** over a 500-query sample against `chronofence_search_exact`; perfect on 293/500, worst query 0.2500; 0 sampled queries had no admissible evidence | **PASS** |
+| 3 | Poison-pill: 0 of 500 retrieved across all 180 scenarios | **0 of 500**. 500 synthetic post-resolution documents inserted, queried at all 180 cutoffs with the poison's own text — the most favourable query it could receive. A positive control asserts the poison *is* retrievable with the time filter removed, and a post-run check asserts the corpus is unchanged | **PASS** |
+| 4 | Date-monotonicity property test over the full trace | **PASS** over 120 Hypothesis examples on the indexed path and 60 on the exact oracle, plus a monotonicity-in-`as_of` property. `published_at >= as_of` is treated as a violation — the promise is *strictly* before | **PASS** |
+| 5 | `memorization_score` for all 180; distribution reported | **NOT RUN** — `CASCADE_ANTHROPIC_API_KEY` is empty in this environment. Implemented, CLI-wired and tested end to end against a mock transport (33 tests); `cascade retrieval memorization` exits **3** with the variable named | **BLOCKED** |
+
+CI: ruff clean, black clean, mypy strict clean (**57 files**), **612 tests**
+(520 unit + 12 determinism + 55 integration + 21 leakage + 4 property), all
+passing. This restates the M2 figure, which recorded 475 against a collection
+that measures 431 at that commit.
+
+**Criterion 5 — a credential, not a defect.** The probe asks the agent model
+each question with zero context and scores `2*|p-0.5|`, deliberately
+direction-free: a confidently *wrong* prior steers the simulation as much as a
+right one. An unparseable answer is reported as unparseable, never scored as
+0.5 — for this number, failing toward "no memorisation detected" would read as
+reassurance. Run it before publication; it is ~180 Haiku calls (well under the
+$5 `bench` ceiling) and the result belongs beside the headline Brier.
+
+**The corpus is concentrated where the scenarios are not.** 88.8% of the
+409,899 chunks fall in 2016q3–2017q2, while scenario cutoffs span 2018-01 to
+2026-09. Retrieval is therefore *correct* — nothing post-cutoff is ever
+returned — but for late-cutoff scenarios the nearest admissible evidence is
+often years stale. That is an M2 coverage problem surfaced by M3, not a
+Chronofence defect, and it is why criterion 1's latency barely varies with the
+cutoff: almost every query scans the same five large partitions. It needs
+closing before the M7 headline means what it claims.
+
+**Defects found and fixed at M3** (each has a regression test):
+
+- **The provenance join cost 5x the entire latency budget.** `chronofence_search`
+  joined `documents` for source/url/title. SECURITY DEFINER and a `SET` clause
+  each independently disqualify a SQL function from inlining, so the planner
+  had no constant for `published_at` and joined against all 52 partitions:
+  15.37 ms against a 2.95 ms body. `CROSS JOIN LATERAL ... LIMIT 1` makes the
+  partition key a runtime constant, so executor pruning probes exactly one
+  partition per hit — **3.34 ms**. The same query *inlined* costs 4.25 ms,
+  which is why this never looked like a slow query, only a slow function
+  (migration 006).
+- **`chronofence_partitions` returned two rows per partition.** The opclass
+  predicate sat on the second of two LEFT JOINs, which nulls non-matching rows
+  rather than removing them; every partition carries a primary key and a
+  document index. 104 rows for 52 partitions, which would have made the index
+  command plan each partition twice and `CREATE INDEX` fail on the second pass
+  (migration 005).
+- **`probes = 10` measured recall@20 = 0.8331.** The spec's value assumes one
+  index; partitioning applies probes per scan. 40 is the smallest value on the
+  measured curve clearing 0.92 (ADR-0013). `lists` was varied too and the
+  spec's `sqrt(rows)` rule is the best of four tried.
+- **`::halfvec(384)` was denied to every role.** A typmod cast runs pgvector's
+  `halfvec(halfvec,integer,boolean)` coercion function, and migration 001
+  revokes EXECUTE on every function in `public` from PUBLIC (ADR-0005), which
+  catches pgvector's own. The client casts to bare `halfvec` — the type input
+  function, which is not privilege-checked — and validates the width in Python
+  with a better message than Postgres would give.
+- **An empty `CASCADE_ANTHROPIC_API_KEY` bypassed the client's guard.**
+  `KEY=` in a `.env` parses to `SecretStr("")`, not `None`, so the SDK raised
+  `TypeError: Could not resolve authentication method` — an error naming
+  neither the variable nor this project.
+- **`percentile()` could report p99 < p95.** `low*(1-w) + high*w` lands one ULP
+  low when `low == high`; the numpy-equivalent `low + (high-low)*w` is exact.
+  Found by a property test, and it would have been dismissed as noise in a
+  bench report.
+- **GDELT's refusals were recorded as this client's parse errors.** The notice
+  arrives under HTTP 200 as readily as 429, so it reached the JSON parser and
+  all three units died as `returned non-JSON`. A marker whitelist fixed two of
+  three; the rule that works is that a 200 which is not JSON is not an answer,
+  because every request carries `format=json` (`Fetcher.classify_body`).
+- **`/dev/shm` was Docker's 64 MB default.** A parallel aggregate over 409,899
+  chunks failed with `DiskFull: could not resize shared memory segment` while
+  the host had 801 GB free. `shm_size: 1gb` in `docker-compose.yml`.
+- **The static `as_of` DEFAULT check fired on prose.** Migration 004's
+  `COMMENT ON FUNCTION ... 'as_of has no default by design'` tripped the
+  invariant it documents. The check now strips `--` comments and string
+  literals before matching, which cannot hide a real default — a parameter
+  default is executable SQL — and a regression test asserts both real forms
+  are still caught.
+
+Improvements beyond the roadmap, implemented rather than suggested:
+
+- **`cascade retrieval verify`** asserts the preconditions structurally: the
+  deployed function's pinned probes equals config, every non-empty partition
+  carries a correctly sized index, and `cascade_sim` is denied on `chunks` and
+  `documents`. Exits 3 on drift, so recall rot is a loud failure.
+- **A recall oracle as a separate function.** `chronofence_search_exact` is
+  granted to `cascade_eval` only, so recall has a ground truth while the
+  simulation keeps exactly one corpus read path.
+- **Deterministic tie-breaking.** `ORDER BY distance, chunk_id` over the k
+  returned rows, so equal distances cannot reorder between replays — M8 has to
+  hash the event log byte-identically.
+- **A positive control in the poison-pill probe.** Without it, a retrieval path
+  that returned nothing at all would pass every leakage assertion.
+
+Deferred, with reasons:
+- **The 1.3M-chunk corpus target and its coverage skew** → M2 work, not M3.
+  `cascade corpus verify` still exits 3 while short.
+- **GDELT** remains externally throttled from this network; all three units are
+  recorded `failed` with an accurate `RateLimited` diagnostic and retry
+  automatically.
+- **`retrieval.k_agent` / `k_compiler` tuning** → M4/M5, when there is an agent
+  whose answers can be scored against the k it was given.

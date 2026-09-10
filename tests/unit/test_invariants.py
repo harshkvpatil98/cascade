@@ -89,20 +89,58 @@ def test_as_of_is_never_defaulted_in_python() -> None:
     )
 
 
+def _sql_code_only(line: str) -> str:
+    """Strip `--` comments and single-quoted literals from one SQL line.
+
+    A parameter default can only appear in executable SQL. It cannot appear
+    inside a comment or a string literal, so scanning those produces false
+    positives and nothing else -- measured: migration 004's `COMMENT ON
+    FUNCTION ... IS '... as_of has no default by design ...'` tripped the
+    check while documenting the very invariant it was accused of breaking.
+
+    Stripping is deliberately crude (no dollar-quoting, no escaped quotes),
+    because the failure direction of crudeness here is a *false positive* on
+    an odd literal, which someone will investigate. It never hides a real
+    default: removing text can only remove matches inside the removed text.
+    """
+    without_comment = line.split("--", 1)[0]
+    return re.sub(r"'[^']*'", "''", without_comment)
+
+
 def test_as_of_is_never_defaulted_in_sql() -> None:
     """Invariant 1 at the SQL boundary: no ``DEFAULT`` on an ``as_of`` argument."""
+    # `[a-z_ ]*` spans multi-word type names such as `timestamp with time zone`,
+    # so a default is caught however the type is spelled.
     pattern = re.compile(r"as_of\s+[a-z_ ]*\bDEFAULT\b", re.IGNORECASE)
     offenders = [
         f"{rel(path)}:{index}"
         for path in sorted(MIGRATIONS_ROOT.glob("*.sql"))
         for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
-        if pattern.search(line)
+        if pattern.search(_sql_code_only(line))
     ]
     assert (
         offenders == []
     ), "as_of must have no SQL default (invariant 1, ADR-0002). Offenders:\n  " + "\n  ".join(
         offenders
     )
+
+
+def test_the_sql_default_check_still_catches_a_real_default() -> None:
+    """The stripping must not have disarmed the check it protects.
+
+    Both forms below are real violations and must still be seen; the third is
+    prose in a string literal and must not be.
+    """
+    pattern = re.compile(r"as_of\s+[a-z_ ]*\bDEFAULT\b", re.IGNORECASE)
+
+    assert pattern.search(_sql_code_only("    as_of timestamptz DEFAULT now(),"))
+    assert pattern.search(
+        _sql_code_only("    as_of timestamp with time zone DEFAULT CURRENT_TIMESTAMP")
+    )
+    assert not pattern.search(
+        _sql_code_only("    'published strictly before as_of. as_of has no default by design '")
+    )
+    assert not pattern.search(_sql_code_only("-- as_of timestamptz DEFAULT now() would be a bug"))
 
 
 # ---------------------------------------------------------------------------

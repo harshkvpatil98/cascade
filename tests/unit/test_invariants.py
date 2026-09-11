@@ -274,3 +274,107 @@ def test_iteration_over_mappings_is_sorted() -> None:
 def test_the_invariant_7_detector_actually_detects(source: str, expected: int) -> None:
     """Guard the guard: a detector that finds nothing would pass silently."""
     assert len(_unsorted_mapping_iteration(ast.parse(source))) == expected
+
+
+# ---------------------------------------------------------------------------
+# Invariant 3 -- the arbiter contains no LLM call and no I/O
+#
+# "The single most important architectural decision in the system" (§7.5), and
+# the one that is easiest to lose by accident: a debug print, a timestamp, a
+# lookup that "just needs the config". The check is over imports because that
+# is what can be verified without running anything, and because every way of
+# reaching the network, the disk or the clock starts with one.
+# ---------------------------------------------------------------------------
+
+# The pure core named by the engineering standards in §13, plus the two modules
+# the kernel factored out of the arbiter. These "take no clock, no RNG from
+# global state, and do no I/O. This is what makes them property-testable."
+PURE_MODULES = (
+    PACKAGE_ROOT / "sim" / "arbiter.py",
+    PACKAGE_ROOT / "sim" / "scheduler.py",
+    PACKAGE_ROOT / "sim" / "dynamics.py",
+    PACKAGE_ROOT / "decompose" / "validator.py",
+    PACKAGE_ROOT / "retrieval" / "metrics.py",
+)
+
+# Roots that can only be there to do something impure.
+IMPURE_ROOTS = frozenset(
+    {
+        "anthropic",
+        "asyncio",
+        "datetime",
+        "httpx",
+        "langfuse",
+        "logging",
+        "os",
+        "pathlib",
+        "psycopg",
+        "random",
+        "requests",
+        "socket",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "time",
+        "urllib",
+    }
+)
+
+# Internal packages that exist to touch something outside the process.
+IMPURE_CASCADE_MODULES = ("cascade.llm", "cascade.db", "cascade.corpus", "cascade.retrieval.search")
+
+
+def _imported_roots(tree: ast.Module) -> set[str]:
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            roots.add(node.module)
+    return roots
+
+
+@pytest.mark.parametrize("path", PURE_MODULES, ids=lambda p: p.name)
+def test_the_pure_core_imports_nothing_that_does_io(path: Path) -> None:
+    """Invariant 3, and §13's "pure core, thin shell" for its neighbours.
+
+    An LLM arbiter would make replay impossible, make cost scale with steps
+    rather than activations, and let the referee smuggle in its own view of the
+    answer. An arbiter that merely *reads the clock* loses replay alone, which
+    is worse -- it still looks deterministic.
+    """
+    imported = _imported_roots(parse(path))
+    offenders = sorted(
+        name
+        for name in imported
+        if name.split(".")[0] in IMPURE_ROOTS
+        or any(name.startswith(prefix) for prefix in IMPURE_CASCADE_MODULES)
+    )
+    assert offenders == [], f"{rel(path)} imports impure module(s): {offenders}"
+
+
+def test_the_arbiter_is_the_module_the_invariant_names() -> None:
+    """Guard the guard: a renamed or emptied arbiter would pass vacuously."""
+    arbiter = PACKAGE_ROOT / "sim" / "arbiter.py"
+    assert arbiter.is_file()
+    source = arbiter.read_text(encoding="utf-8")
+    assert "def arbitrate(" in source
+    assert "def contest(" in source
+    assert len(source.splitlines()) > 200
+
+
+@pytest.mark.parametrize("path", PURE_MODULES, ids=lambda p: p.name)
+def test_the_pure_core_takes_no_global_randomness(path: Path) -> None:
+    """A second RNG is one of the two causes of an M8 replay divergence.
+
+    The arbiter's jitter arrives as an argument drawn from the run's own plan
+    (ADR-0015); a module-level `np.random` call would be invisible in every
+    test that did not compare two processes.
+    """
+    source = parse(path)
+    calls = [
+        node
+        for node in ast.walk(source)
+        if isinstance(node, ast.Attribute) and node.attr in {"seed", "default_rng", "RandomState"}
+    ]
+    assert calls == [], f"{rel(path)} reaches for a generator of its own"

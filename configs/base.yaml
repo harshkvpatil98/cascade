@@ -51,6 +51,11 @@ kernel:
   steps: 24
   max_step_delta: 0.12
   contest_gamma: 1.6
+  # Per-chunk excerpt length in an agent's cached prefix. The static prefix is
+  # rules + tool schema + persona + evidence; measured at ~2,900 tokens before
+  # evidence, so the excerpts are what carry it over the provider's
+  # 4,096-token cache floor (ADR-0001). Also bounds the §12.1 prompt.
+  evidence_chars: 900
   activation:
     salience_threshold: 0.06
     forced_interval: 5

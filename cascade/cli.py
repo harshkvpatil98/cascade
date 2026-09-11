@@ -12,7 +12,7 @@ import subprocess
 import sys
 from decimal import Decimal
 from importlib import metadata
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -56,6 +56,11 @@ compile_app = typer.Typer(
     help="Lathe: compile scenarios into typed causal graphs (M4).", no_args_is_help=True
 )
 app.add_typer(compile_app, name="compile")
+simulate_app = typer.Typer(
+    help="Loom + Aperture: run seeded simulations of a compiled scenario (M5).",
+    no_args_is_help=True,
+)
+app.add_typer(simulate_app, name="simulate")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -70,7 +75,13 @@ def _settings(overlay: str | None) -> Settings:
     return load_settings(overlay)
 
 
-def _fail(message: str, code: int) -> None:
+def _fail(message: str, code: int) -> NoReturn:
+    """Print an error and exit with ``code``.
+
+    Typed ``NoReturn`` so a caller's later code is unreachable to the type
+    checker too: a guard that raises but is typed as returning None leaves
+    every value it was guarding still optional at the call site.
+    """
     err_console.print(f"[bold red]error[/bold red] {message}")
     raise typer.Exit(code)
 
@@ -242,12 +253,6 @@ def _not_yet(name: str, milestone: str) -> None:
 
 
 @app.command()
-def simulate(config: OverlayOpt = None) -> None:
-    """Run the seeded ensemble (M5/M6)."""
-    _not_yet("simulate", "M5/M6")
-
-
-@app.command()
 def evaluate(config: OverlayOpt = None) -> None:
     """Score forecasts, run the ablation grid, write metrics (M7)."""
     _not_yet("evaluate", "M7")
@@ -293,7 +298,6 @@ def db_migrate(
         applied = apply_all(settings)
     except MigrationError as exc:
         _fail(str(exc), EXIT_PRECONDITION)
-        return
     for migration in applied:
         console.print(f"[green]applied[/green] {migration.name}")
 
@@ -308,7 +312,6 @@ def db_status(config: OverlayOpt = None) -> None:
         already = applied_versions(settings)
     except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
         _fail(f"cannot reach database: {exc}", EXIT_PRECONDITION)
-        return
 
     table = Table(title="Migrations")
     table.add_column("Version", style="cyan")
@@ -620,7 +623,6 @@ def ledger_seal(config: OverlayOpt = None) -> None:
         _fail(
             "no scenarios are loaded; run `cascade ledger build --write` first", EXIT_PRECONDITION
         )
-        return
 
     climatology = climatology_of(records)
     ledger_cfg = settings.ledger
@@ -660,13 +662,11 @@ def ledger_verify(config: OverlayOpt = None) -> None:
     sealed = read_manifest(settings, role="admin")
     if sealed is None:
         _fail("the registry has never been sealed; run `cascade ledger seal`", EXIT_PRECONDITION)
-        return
     records = load_records(settings, role="admin")
     try:
         verify_manifest(records, sealed.manifest_sha256)
     except ManifestMismatch as exc:
         _fail(str(exc), EXIT_PRECONDITION)
-        return
     console.print(
         f"[green]manifest verified[/green] {sealed.n_scenarios} scenarios, "
         f"sha256 {sealed.manifest_sha256[:16]}..."
@@ -1415,6 +1415,371 @@ def compile_audit(
         "[dim]Fill in every score, then run `cascade compile audit --score`. "
         "The graphs are shown without their outcomes on purpose (§5.4).[/dim]"
     )
+
+
+# ---------------------------------------------------------------------------
+# simulate: Loom + Aperture (M5)
+# ---------------------------------------------------------------------------
+
+# §7.3's mean activation rate, and the tolerance the spec states for it. Named
+# here so the CLI can print the criterion beside the measurement; nothing in
+# `cascade/sim/` reads either number.
+ACTIVATION_TARGET = 0.347
+ACTIVATION_TOLERANCE = 0.04
+
+
+def _load_simulation(settings: Settings, scenario_id: str, *, policy: str) -> Any:
+    """Wire a Loom for one scenario: graph, policies, and whatever decides.
+
+    Retrieval for the agent prefixes runs as `eval` for the same reason the
+    compiler's does -- it is preparation, not a run -- and it goes through
+    Chronofence either way, so the time lock is identical.
+    """
+    from cascade.aperture.policy import derive_policies
+    from cascade.decompose.store import load_graph
+    from cascade.ledger.store import load_scenarios
+    from cascade.sim.kernel import Loom, mechanics_from
+
+    graph = load_graph(settings, scenario_id, role="admin")
+    if graph is None:
+        _fail(
+            f"scenario {scenario_id!r} has no compiled graph; run `cascade compile build` first",
+            EXIT_PRECONDITION,
+        )
+    scenarios = {item.scenario_id: item for item in load_scenarios(settings, role="admin")}
+    scenario = scenarios.get(scenario_id)
+    if scenario is None:
+        _fail(f"scenario {scenario_id!r} is not in the registry", EXIT_PRECONDITION)
+
+    policies = derive_policies(
+        graph, settings.aperture, asymmetry=settings.flags.information_asymmetry
+    )
+
+    if policy == "agent":
+        decider: Any = _agent_policy(settings, graph, scenario, policies)
+    else:
+        mechanics = mechanics_from(graph)
+        from cascade.sim.policies import HeuristicPolicy
+
+        decider = HeuristicPolicy(
+            utility={actor_id: dict(mechanics[actor_id].utility) for actor_id in sorted(mechanics)}
+        )
+    return Loom(settings=settings, graph=graph, policies=policies, decider=decider), graph
+
+
+def _agent_policy(settings: Settings, graph: Any, scenario: Any, policies: Any) -> Any:
+    """Build the model-backed decider, retrieving each actor's evidence once.
+
+    Once per (scenario, actor), not once per step (ADR-0019). `as_of` is the
+    scenario cutoff for the whole run, so a per-step query would re-retrieve
+    the same chunks 24 times, cost 4.2M vector searches across the study, and
+    put the dynamic half of the prompt an order of magnitude over the 260
+    tokens §12.1 budgets for it.
+    """
+    from cascade.aperture.policy import counterparties, levers_by_actor
+    from cascade.corpus.embed import Embedder
+    from cascade.llm.client import LLMClient
+    from cascade.retrieval.search import Chronofence
+    from cascade.sim.agent import LLMAgents, prepare_actor
+    from cascade.sim.prompts import brief_from
+
+    _require_api_key(settings)
+    embedder = Embedder(
+        model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
+    )
+    embedder.load()
+    levers = levers_by_actor(graph)
+    parties = counterparties(policies)
+    context = f"{scenario.question}\n\nResolution: {scenario.resolution_criterion}"
+
+    prepared = {}
+    with Chronofence(settings, role="eval") as fence:
+        for actor in sorted(graph.actors, key=lambda a: a.id):
+            query = f"{scenario.question} {actor.name} {actor.objective}"
+            vector = embedder.encode([query])[0]
+            found = fence.search(vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent)
+            brief = brief_from(
+                actor,
+                levers={
+                    factor: weight
+                    for factor, weight in sorted(_leverage_of(graph, actor.id).items())
+                    if factor in levers.get(actor.id, ())
+                },
+                counterparties=parties.get(actor.id, ()),
+                horizon=settings.kernel.steps,
+                question_context=context,
+                evidence=tuple(
+                    (chunk.published_at.isoformat(), chunk.source, chunk.body)
+                    for chunk in found.chunks
+                ),
+            )
+            prepared[actor.id] = prepare_actor(brief, settings)
+
+    short = sorted(actor_id for actor_id in sorted(prepared) if not prepared[actor_id].cacheable)
+    if short:
+        console.print(
+            f"[yellow]{len(short)} of {len(prepared)} actor prefixes are below the "
+            f"{settings.prompt_cache.min_prefix_tokens}-token cache floor[/yellow] and are sent "
+            "unmarked: marking them would pay the write premium for a cache the provider "
+            "silently declines (ADR-0001)."
+        )
+    return LLMAgents(
+        settings=settings, client=LLMClient(settings, phase="simulate"), prepared=prepared
+    )
+
+
+def _leverage_of(graph: Any, actor_id: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for edge in sorted(graph.edges, key=lambda e: (e.src, e.dst, e.lag)):
+        if edge.src == actor_id:
+            out[edge.dst] = max(out.get(edge.dst, 0.0), float(edge.weight))
+    return out
+
+
+def _print_run_table(results: Any) -> None:
+    """Print what the runs measured. Targets are printed beside, never into."""
+    table = Table(title="Runs (M5, spec §7)")
+    table.add_column("run", style="cyan")
+    table.add_column("steps", justify="right")
+    table.add_column("end", justify="right")
+    table.add_column("decisions", justify="right")
+    table.add_column("activation", justify="right")
+    table.add_column("outcome", justify="right")
+    table.add_column("event hash", justify="right")
+    for result in results:
+        table.add_row(
+            f"{result.spec.scenario_id}#{result.spec.replicate}",
+            str(result.steps_run),
+            result.termination,
+            str(result.decisions),
+            f"{result.activation_rate:.3f}",
+            f"{result.outcome_score:.4f}",
+            result.event_log_hash[:12],
+        )
+    console.print(table)
+
+
+@simulate_app.command("run")
+def simulate_run(
+    config: OverlayOpt = None,
+    scenario: Annotated[
+        str | None, typer.Option("--scenario", help="Scenario id to simulate.")
+    ] = None,
+    replicates: Annotated[
+        int, typer.Option("--replicates", help="How many seeded replicates to run.")
+    ] = 1,
+    policy: Annotated[
+        str,
+        typer.Option(
+            "--policy",
+            help="'agent' (the pinned model) or 'heuristic' (a stand-in; runs are stamped).",
+        ),
+    ] = "agent",
+    store: Annotated[
+        bool, typer.Option("--store/--no-store", help="Write runs, steps and events to Postgres.")
+    ] = True,
+) -> None:
+    """Run seeded replicates of one compiled scenario (M5, spec §7.2).
+
+    Resumable: replicates already stored for this (scenario, config) are
+    skipped, because a run row exists only for a run that finished.
+    """
+    import uuid
+    from datetime import UTC, datetime
+
+    import numpy as np
+
+    from cascade.decompose.schema import graph_hash
+    from cascade.sim.kernel import RunSpec
+    from cascade.sim.rng import run_seed
+    from cascade.trace.store import completed_replicates, write_run
+
+    settings = _settings(config)
+    if policy not in {"agent", "heuristic"}:
+        _fail(f"unknown policy {policy!r}; expected 'agent' or 'heuristic'", EXIT_PRECONDITION)
+    if scenario is None:
+        _fail("--scenario is required at M5; the 36,000-run fan-out lands at M6", EXIT_PRECONDITION)
+
+    config_id = config or "base"
+    loom, graph = _load_simulation(settings, scenario, policy=policy)
+    done = (
+        completed_replicates(settings, scenario_id=scenario, config_id=config_id)
+        if store
+        else set()
+    )
+    todo = [index for index in range(replicates) if index not in done]
+    if not todo:
+        console.print(f"nothing to do: {len(done)} replicate(s) already stored")
+        return
+    if policy != "agent":
+        console.print(
+            "[yellow]policy=heuristic[/yellow]: these runs are stamped in the `runs` table and "
+            "are not study data. No acceptance number may be read off them."
+        )
+
+    results = []
+    started = datetime.now(UTC)
+    for replicate in todo:
+        spec = RunSpec(
+            run_id=str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"cascade/{scenario}/{config_id}/{replicate}")
+            ),
+            scenario_id=scenario,
+            config_id=config_id,
+            replicate=replicate,
+            policy=policy,
+        )
+        result = loom.run(spec)
+        results.append(result)
+        if store:
+            write_run(
+                settings,
+                result,
+                started_at=started,
+                graph_sha256=graph_hash(graph),
+                run_seed=run_seed(
+                    scenario_id=scenario,
+                    config_id=config_id,
+                    replicate=replicate,
+                    salt=settings.study.salt,
+                ),
+                numpy_version=np.__version__,
+            )
+    _print_run_table(results)
+    mean_rate = sum(r.activation_rate for r in results) / len(results)
+    mean_events = sum(r.decisions for r in results) / len(results)
+    console.print(
+        f"mean activation [bold]{mean_rate:.4f}[/bold] over {len(results)} run(s); "
+        f"mean decisions/run [bold]{mean_events:.1f}[/bold]"
+    )
+
+
+@simulate_app.command("activation")
+def simulate_activation(
+    config: OverlayOpt = None,
+    runs: Annotated[int, typer.Option("--runs", help="Sample size, spread over scenarios.")] = 50,
+    policy: Annotated[str, typer.Option("--policy")] = "agent",
+    replicates: Annotated[
+        int, typer.Option("--replicates", help="Replicates per sampled scenario.")
+    ] = 1,
+) -> None:
+    """Measure the mean activation rate over a sample of runs (M5 criterion 2).
+
+    Prints the measured rate against §7.3's 34.7% +/- 4 points and exits 3 when
+    a model-driven sample misses the band -- a scheduler that drifts to 90%
+    multiplies cost by three and one that drifts to 10% has stopped simulating
+    interaction. A sample run under a stand-in policy reports and does not
+    gate, because the number it produces is not about the agents.
+    """
+    import uuid
+
+    from cascade.decompose.store import completed_scenarios
+    from cascade.sim.kernel import RunSpec
+
+    settings = _settings(config)
+    config_id = config or "base"
+    available = sorted(completed_scenarios(settings))
+    if not available:
+        _fail(
+            "no compiled graphs; the activation rate is a property of real "
+            "decompositions, so run `cascade compile build` first",
+            EXIT_PRECONDITION,
+        )
+
+    per_step: dict[int, list[float]] = {}
+    rates: list[float] = []
+    decisions: list[int] = []
+    sampled = 0
+    for scenario_id in available:
+        if sampled >= runs:
+            break
+        loom, _ = _load_simulation(settings, scenario_id, policy=policy)
+        for replicate in range(replicates):
+            if sampled >= runs:
+                break
+            result = loom.run(
+                RunSpec(
+                    run_id=str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"cascade/{scenario_id}/{config_id}/{replicate}",
+                        )
+                    ),
+                    scenario_id=scenario_id,
+                    config_id=config_id,
+                    replicate=replicate,
+                    policy=policy,
+                )
+            )
+            rates.append(result.activation_rate)
+            decisions.append(result.decisions)
+            for record in result.step_records:
+                per_step.setdefault(record.step, []).append(record.activation_rate)
+            sampled += 1
+
+    if not rates:
+        _fail("no runs were executed", EXIT_PRECONDITION)
+
+    mean_rate = sum(rates) / len(rates)
+    mean_decisions = sum(decisions) / len(decisions)
+    table = Table(title="Activation (M5, spec §7.3)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Criterion", justify="right")
+    table.add_row("runs sampled", str(len(rates)), "50")
+    table.add_row(
+        "mean activation rate",
+        f"{mean_rate:.4f}",
+        f"{ACTIVATION_TARGET:.3f} +/- {ACTIVATION_TOLERANCE:.2f}",
+    )
+    table.add_row("mean decisions / run", f"{mean_decisions:.1f}", "116.6")
+    table.add_row("min / max run rate", f"{min(rates):.3f} / {max(rates):.3f}", "-")
+    console.print(table)
+
+    profile = ", ".join(
+        f"s{step}={sum(values) / len(values):.2f}"
+        for step, values in sorted(per_step.items())
+        if step < 8
+    )
+    console.print(f"[dim]per-step (first 8): {profile}[/dim]")
+
+    if policy != "agent":
+        console.print(
+            f"[yellow]policy={policy}[/yellow]: measured under a stand-in decider, so this is a "
+            "diagnostic of the scheduler, not the M5 acceptance figure."
+        )
+        return
+    if abs(mean_rate - ACTIVATION_TARGET) > ACTIVATION_TOLERANCE:
+        _fail(
+            f"mean activation {mean_rate:.4f} is outside "
+            f"{ACTIVATION_TARGET:.3f} +/- {ACTIVATION_TOLERANCE:.2f} (spec §7.3)",
+            EXIT_PRECONDITION,
+        )
+    console.print("[bold green]activation rate is inside the §7.3 band[/bold green]")
+
+
+@simulate_app.command("status")
+def simulate_status(config: OverlayOpt = None) -> None:
+    """Report measured figures over the stored runs."""
+    from cascade.trace.store import run_stats
+
+    settings = _settings(config)
+    stats = run_stats(settings, config_id=config)
+    table = Table(title="Simulation (M5/M6)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_row("runs", str(stats.runs))
+    table.add_row("scenarios", str(stats.scenarios))
+    table.add_row("configs", ", ".join(stats.configs) or "-")
+    table.add_row("policies", ", ".join(stats.policies) or "-")
+    table.add_row("decision events", f"{stats.events:,}")
+    table.add_row("mean events / run", f"{stats.mean_events_per_run:.1f}")
+    table.add_row("mean activation rate", f"{stats.mean_activation_rate:.4f}")
+    table.add_row("mean steps / run", f"{stats.mean_steps:.2f}")
+    table.add_row("runs ended by absorption", str(stats.absorbed_runs))
+    table.add_row("action-cache hit rate", f"{stats.cache_hit_rate:.4f}")
+    table.add_row("distinct event-log hashes", str(stats.distinct_event_hashes))
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------

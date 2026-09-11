@@ -35,10 +35,10 @@ runner = CliRunner()
 CONSOLE_SCRIPT = Path(sys.executable).parent / "cascade"
 
 # Phases still to land. Each must refuse loudly rather than exit 0.
-# `ledger` left the stub list at M1, `corpus` at M2, `retrieval` arrived at M3
-# and `compile` at M4; all four are now sub-apps.
-DEFERRED_PHASES = ["simulate", "evaluate", "trace", "report"]
-IMPLEMENTED_SUBAPPS = ["ledger", "corpus", "db", "retrieval", "compile"]
+# `ledger` left the stub list at M1, `corpus` at M2, `retrieval` arrived at M3,
+# `compile` at M4 and `simulate` at M5; all five are now sub-apps.
+DEFERRED_PHASES = ["evaluate", "trace", "report"]
+IMPLEMENTED_SUBAPPS = ["ledger", "corpus", "db", "retrieval", "compile", "simulate"]
 
 
 # ---------------------------------------------------------------------------
@@ -307,5 +307,5 @@ def test_typer_exit_codes_survive_the_boundary(monkeypatch: pytest.MonkeyPatch) 
     """
     import cascade.cli as cli_module
 
-    monkeypatch.setattr(sys, "argv", ["cascade", "simulate"])
+    monkeypatch.setattr(sys, "argv", ["cascade", "evaluate"])
     assert cli_module.main() == EXIT_PRECONDITION

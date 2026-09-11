@@ -141,14 +141,18 @@ cascade compile status     # graph statistics and the repair-retry histogram
 cascade compile verify     # re-validate and re-hash every stored graph; exits 3 on drift
 cascade compile audit      # write the seeded 20-graph audit worksheet (§5.4)
 cascade compile audit --score  # publish the audit mean; exits 3 below 1.5
+
+cascade simulate run --scenario ID --replicates N   # seeded runs of one scenario
+cascade simulate activation --runs 50   # measure the §7.3 rate; exits 3 outside the band
+cascade simulate status    # measured figures over the stored runs
 ```
 
 ---
 
 ## 7. Architecture decisions
 
-Fourteen ADRs in `docs/adr/`. Seven correct defects found in the spec; the rest
-record choices the spec left open.
+Nineteen ADRs in `docs/adr/`. Eleven correct defects found in the spec; the
+rest record choices the spec left open.
 
 | ADR | Decision | Milestone |
 |---|---|---|
@@ -166,6 +170,11 @@ record choices the spec left open.
 | 0012 | IVFFlat index lifecycle is an operational command, not a migration -- `lists ≈ sqrt(rows)` is a function of measured data, and an index built on an empty partition is permanently degenerate | M3 |
 | 0013 | `ivfflat.probes` is 40, not the spec's 10: quarterly partitioning fans one query across 36 index scans and probes applies per scan, so the single-index value measures recall@20 = 0.8331 against a > 0.92 criterion | M3 |
 | 0014 | `OutcomeRule` and `UtilityTerm` -- referenced by §5.1 but never defined there -- are declarative, signed and monotone by construction, so §5.3's monotonicity rule holds for any rule that parses | M4 |
+| 0015 | The run RNG draws a whole step at once in unit normals, and the draw count is a function of the graph alone; §8.1 calls the PRNG counter-based where §8.2 pins PCG64, `rng_counter` alone cannot resume it, and a policy-dependent draw count would confound the §6.4 ablation | M5 |
+| 0016 | Action visibility is per target; §6.2's schema carries one enum per policy and its own derivation rule assigns full to some actors and type_only to others | M5 |
+| 0017 | `WorldState` carries the alliance pool ledger and the scheduler's per-actor history; §7.1's field list cannot express §7.4's ALLY/DEFECT, §7.3's activation or §7.6's absorption | M5 |
+| 0018 | An action the actor cannot take is coerced to WAIT and the reason recorded on the event, rather than re-prompted (a second call on every occurrence) or executed silently | M5 |
+| 0019 | Evidence is retrieved once per (scenario, actor) into the cached prefix; §7.2 retrieves per step, which is 4.2M searches and ~10x §12.1's 260-token dynamic budget -- and the evidence block is what carries the prefix over the provider's cache floor | M5 |
 
 ---
 
@@ -676,3 +685,213 @@ Deferred, with reasons:
   credential.
 - **GDELT ingest** → the adapter is correct and now targets a servable window,
   but this IP is throttled hard enough that 768 units is impractical from here.
+
+### M5 — Kernel + Aperture · *implemented and tested; 1 of 3 acceptance criteria fully met, 1 partial, 1 blocked on M4's output*
+
+Shipped: `cascade/sim/` — `state.py` (§7.1 `WorldState` plus the four fields
+§7.1 omits, ADR-0017), `rng.py` (the whole-step draw plan, ADR-0015),
+`actions.py` (the §7.4 union and admissibility, ADR-0018), pure `scheduler.py`
+(§7.3), pure `dynamics.py` (stages 1–2 and §7.6 absorption), pure `arbiter.py`
+(§7.5, 637 lines of which 272 are code, no I/O), `kernel.py` (the six-stage
+loop as a LangGraph state graph), `prompts.py`, `agent.py`, `policies.py`;
+`cascade/aperture/` — `policy.py` (derivation from topology),
+`projection.py`, `memory.py` (§6.3, computed digest); `cascade/trace/` — `events.py` (the §11.1 row types, the
+causal ledger, the replay hash) and `store.py`; migration 009 (`runs`,
+`run_steps`, `events` hash-partitioned 32, append-only grants);
+`cascade simulate run|activation|status`; ADRs 0015–0019. Scale: **4,304
+lines** across 18 modules in `sim/`, `aperture/` and `trace/`.
+
+**Measured acceptance values.**
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | Four arbiter property tests (bounded, conserving, permutation-invariant, monotone) | All four **pass** over Hypothesis-generated action sets — 7 properties, the four acceptance ones at 100–150 generated examples each. Boundedness holds through the fold *after* the ESCALATE jitter; conservation is stated as `total_after == total_before − debits + refunds` and holds to 1e-9 (float associativity, not slack) | **PASS** |
+| 2 | Mean activation rate 34.7% ± 4 pts on a 50-run sample | **NOT RUN** — the rate is a property of real decompositions and real agents; no graph has been compiled (M4 is blocked on the same credential). `cascade simulate activation` is implemented and exits **3** naming the missing input | **BLOCKED** |
+| 3 | One scenario runs 24 steps end to end; `WorldState` serialization round-trips exactly | Round-trip: **PASS**, exactly — every field equal and `state_hash` equal, on a hand-built awkward-float state and on real run output. End to end: **24/24 steps** on a fixture graph under a stand-in decider, 184 decisions, byte-identical across processes. **Not run on a compiled scenario** | **PARTIAL** |
+
+CI: ruff clean, black clean, mypy strict clean (**78 files**), **786 offline
+tests** pass (754 unit + 13 property + 19 determinism); 885 collected in total,
+99 of them deselected without live services. M5 added **143** tests, of which
+7 are the acceptance properties.
+
+**What blocks criteria 2 and 3, exactly.** Both read off *compiled* graphs,
+which need `CASCADE_ANTHROPIC_API_KEY` (empty here) and ~540 Sonnet calls at
+M4. The kernel itself needs no credential: the simulation is deterministic
+Python plus one LLM call per uncached decision, and every test above runs the
+real scheduler, the real Aperture, the real arbiter and the real draw plan with
+only the decider substituted. What cannot be substituted is the *content* of a
+decomposition — factor volatility, how many levers an actor holds, whether
+actors contest the same factors — and that is precisely what criterion 2
+measures.
+
+**The activation rate is a function of factor volatility, and nobody has seen a
+compiled graph's volatilities yet.** Measured on the fixture graph (14 actors,
+8 factors, cap 8, salience threshold 0.06), mean rate over 12 replicates:
+
+| factor volatility | 0.01 | 0.02 | 0.03 | 0.04 | 0.06 | 0.08 | 0.10 | 0.15 |
+|---|---|---|---|---|---|---|---|---|
+| inert agents | 0.199 | 0.243 | 0.370 | 0.468 | 0.529 | 0.541 | 0.543 | 0.544 |
+| stand-in agents | 0.366 | 0.392 | 0.476 | 0.524 | 0.545 | 0.547 | 0.548 | 0.548 |
+| decisions / run | 123.0 | 131.7 | 160.0 | 176.1 | 183.2 | 183.9 | 184.0 | 184.0 |
+
+The scheduled floor is 1/5 = 0.200 and the cap is 8/14 = 0.571. Above
+volatility ≈ 0.06 the exogenous walk alone trips the 0.06 threshold on some
+observed factor almost every step for almost every actor, and the rate pins to
+the cap. The spec's 34.7% and its 116.6 decisions/run correspond to volatility
+around **0.01–0.02** — factors that move ~1–2% of their range per step.
+
+`cascade/decompose/prompts.py` currently tells the compiler only that
+volatility is "sigma of its per-step exogenous random walk, [0, 1]", with no
+scale anchor. A model asked for a number in [0, 1] with no anchor will not
+reliably land near 0.02. **If compiled graphs come back with volatility ~0.1,
+the study runs ~184 decisions per run instead of 116.6 — a ~58% overrun on the
+simulate phase — and criterion 2 fails for a reason that lives in M4's prompt,
+not in M5's scheduler.** This was deliberately *not* fixed in this session:
+changing the compiler prompt to move a measured rate toward 34.7% is the kind
+of steering §1 forbids, and it belongs to M4's gate with the change recorded in
+`prompt_revisions`. The defensible version is to give `volatility` a scale
+anchor (what one step means in wall-clock terms, and that it is the standard
+deviation of one step's drift), not to tune the number until the rate lands.
+**Decide this before compiling 180 graphs**, because recompiling costs the
+compile budget again.
+
+**Prompt and cost measurements** (estimator, not billing):
+
+| Layer | Tokens | Note |
+|---|---|---|
+| `RULES` (static, study-wide) | ~1,389 | world model, action semantics, arbiter mechanics |
+| action tool schema | ~1,527 | generated from the Pydantic union |
+| persona + 6 evidence excerpts | ~1,739 | per (scenario, actor), `evidence_chars: 900` |
+| **static prefix** | **~4,652** | clears the 4,096 floor, so caching is real (ADR-0001, ADR-0019) |
+| dynamic turn (observation + 12-entry memory) | ~178 | §12.1 budgets 260 |
+
+This is the first prompt in the system that is actually cacheable, and it is
+cacheable *because* the evidence lives in the prefix (ADR-0019). §12.1's 260
+dynamic tokens and §7.2's per-step `chronofence.search(..., k=6)` cannot both
+be true — six chunks are up to 3,072 tokens — and `as_of` is fixed at the
+scenario cutoff for the whole run, so per-step retrieval returns the same
+chunks 24 times for 4.2M searches.
+
+**Defects found and fixed at M5** (each has a regression test):
+
+- **The outcome rule could return exactly 1.0**, breaking the open range
+  ADR-0014 promises and that §7.6 and the M7 log-loss depend on. The logistic
+  is mathematically open on (0, 1) for any finite exponent and float64 is not:
+  at |x| >= 37, `1 + exp(-x)` rounds to 1.0. Measured on a rule with five
+  weights of -1.0, threshold 1.0 and steepness 8, evaluated with every factor
+  at 0.0 -- which is not a corner case, because §7.6 drives runs toward states
+  where factors pin at their bounds. The exponent is now clamped at 36, the
+  largest magnitude still representably below 1.0. M4 code, found by an M4
+  property test that had not previously generated that combination.
+- **An ALLY answered by the ally's DEFECT in the same step created resource out
+  of nothing.** The returned pledge was booked as a refund, so a round trip
+  through an alliance pool increased the world's total. Transfers (pledges,
+  releases) and creation (WAIT/CONCEDE refunds) are now separate terms and only
+  creation enters the conservation identity. Found by the property test, on a
+  generated two-action case — not by inspection.
+- **Admissibility was enforced in the agent adapter, not at the kernel
+  boundary**, so any decider that did not go through the model — the stand-in
+  policy, and anything added later — could hand the arbiter an action on a
+  lever its actor does not hold, executed with no record. The kernel now
+  re-checks whatever it is given (ADR-0018).
+- **LangGraph's default recursion limit is 25**, and the step loop is six nodes
+  per step: a 24-step run would have stopped four steps in, returning a world
+  and an outcome score that nothing downstream would have questioned. The limit
+  is set from `kernel.steps` and asserted.
+- **`_fail()` in the CLI was typed as returning `None`** while always raising,
+  so mypy left every value it guarded still optional and three call sites
+  carried dead `return` statements to compensate. Typed `NoReturn`.
+- **`percentile`-style float drift in the arbiter's sums**: efforts are now
+  accumulated in sorted actor order (§8.1), which is what makes the permutation
+  property hold exactly rather than approximately.
+- **Two tests measured the machine rather than the code.** Both surfaced only
+  under a full-suite run competing with a corpus ingest, which is exactly when
+  nobody wants to debug them. The boundedness property tripped Hypothesis's
+  `too_slow` health check during input *generation* — the property was never
+  evaluated — and the GDELT throttle test computed its pacing wait by
+  subtracting real elapsed time, so a slow machine made the wait shorter than
+  the interval it asserts. The health check is now suppressed on the arbiter
+  properties (no assertion relaxed) and the fetcher test freezes the clock and
+  advances it only by a recorded sleep. M2 test, found at M5.
+
+Design decisions recorded (full reasoning in the ADRs):
+
+- **The whole step's randomness is drawn at once**, in unit normals, with a
+  draw count that is a function of the graph alone (ADR-0015). This is what
+  lets the §6.4 ablation run the identical stream through a transparent policy:
+  with lazy draws, a policy with no noise would skip its draws and shift every
+  later exogenous shock, so the measured +0.027 would include the shift.
+  `rng_counter == step × draws_per_step` is asserted at the end of every step.
+- **The scheduler's movement trigger reads the factor's trajectory, not the
+  actor's noisy readings.** A two-hop channel carries σ = 0.15 against a 0.06
+  threshold, so triggering on readings would make the activation rate — and the
+  per-run cost — a function of the visibility policy.
+- **Exogenous shocks are not events.** §11.1's table is one row per agent
+  decision; adding 864,000 world-movement rows would put the M6 count 20% over
+  a criterion stated as 4.2M ± 5%. They live in `run_steps`, where §11.2's
+  chain terminates.
+- **Invariant 6 is a grant.** `cascade_sim` holds SELECT and INSERT on `runs`,
+  `run_steps` and `events` and nothing else; an UPDATE or DELETE is a
+  permission error, verified against the live database. Re-inserting a replayed
+  run is idempotent through `ON CONFLICT DO NOTHING`, which modifies no
+  existing row and so needs no UPDATE.
+- **A run row is written once, at completion.** There is no status column to
+  disagree with reality: M6's "skip completed units" is a set difference.
+- **Runs made with a stand-in decider are stamped** `policy='heuristic'` in the
+  `runs` table. A footnote is not a mechanism; the column is.
+
+Improvements beyond the roadmap, implemented rather than suggested:
+
+- **Cross-process replay is tested now, not at M8.** `tests/determinism/`
+  re-runs a scenario in a subprocess under three `PYTHONHASHSEED` values and
+  compares the event-log hash, the per-step state hashes and the outcome. A set
+  iterated for a tie-break is stable within a process and diverges across one.
+- **Per-step state hashes**, so an M8 bisect names the step that diverged
+  rather than the run.
+- **Invariant 3 is enforced statically.** `tests/unit/test_invariants.py` now
+  fails CI if `arbiter.py`, `scheduler.py`, `dynamics.py`, `validator.py` or
+  `retrieval/metrics.py` imports anything that reaches the network, the disk,
+  the clock or a generator of its own.
+- **Factor-to-factor propagation.** Without it the compiled edges would be
+  decoration and the eight factors would be eight independent random walks
+  wearing a causal graph's clothes.
+
+Deferred, with reasons:
+
+- **Criterion 2, and the compiled-scenario half of criterion 3** → both need
+  M4's 180 graphs, which need the credential. The commands exist and exit 3.
+- **The 36,000-run fan-out, the worker pool and mid-run resume** → M6. The
+  per-run pieces resume already (`completed_replicates` is a set difference and
+  `RngState` restores a stream bit-for-bit); what is not written is the
+  parallel driver, and writing it here would mean writing it without the
+  checkpointing criterion that gates it.
+- **Batch API submission** → M6, unchanged since M0.
+- **`events` written with `executemany`, not COPY.** Fine at M5 volumes; 4.2M
+  rows at M6 will want COPY, and the row projection is already a pure function.
+- **`retrieval.k_agent` tuning** → M6/M7, when there is a scored answer to tune
+  against. Note ADR-0019 makes `k_agent` a per-run cost, not a per-step one.
+
+**Corpus and index state at the close of M5** (M2/M3 work, recorded here
+because it moved). Ingest has continued: the corpus stands at **933,935
+chunks** across 37 non-empty quarterly partitions, **71.8%** of the 1.30M
+target, up from 587,655 at M4. `cascade corpus verify` still exits 3.
+
+The growth had already outrun the indexes, exactly as ADR-0012 predicts:
+`chunks_2017q3` had grown to **312,461 rows with no IVFFlat index at all**, so
+every query touching 2017q3 was falling back to a sequential scan -- correct,
+and nowhere near the 15 ms budget. `cascade retrieval index` was re-run here:
+**created 1, rebuilt 1, kept 35, skipped 15 empty, 149.6 s**. Two integration
+tests were failing on this before the rebuild and pass after.
+
+A `cascade corpus build --source ccnews` was still running through this
+session, so a partition drifted back past the 25% rebuild tolerance during the
+index pass itself. That is the documented behaviour, not a defect: sizing is a
+function of measured rows (ADR-0012), and an actively growing corpus will keep
+drifting. The index pass is cheap and idempotent -- run it again once ingest
+stops.
+
+**The M3 acceptance numbers are still measured against a 409,899-chunk
+corpus.** They have not been re-measured against 933,935, and p95 is the
+criterion most likely to have moved. Re-run `cascade retrieval index` and then
+`cascade retrieval bench` before quoting them again.
+

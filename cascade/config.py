@@ -142,6 +142,10 @@ class KernelConfig(_Model):
     steps: int
     max_step_delta: float
     contest_gamma: float
+    # Characters of each retrieved chunk carried into an agent's cacheable
+    # prefix. Bounded so the prefix has a stable length, and large enough that
+    # the prefix clears the provider's 4,096-token cache floor (ADR-0001).
+    evidence_chars: int
     activation: ActivationConfig
     memory: MemoryConfig
 

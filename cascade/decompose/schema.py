@@ -55,6 +55,10 @@ MAX_FACTORS = 12
 
 RiskPosture = Literal["averse", "neutral", "seeking"]
 
+# See `OutcomeRule.__call__`: beyond this the float64 logistic saturates onto
+# the bound it is documented never to reach.
+_MAX_LOGIT = 36.0
+
 # A slug: stable across recompilations, safe in a JSON key and in a prompt.
 Slug = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")]
 Unit = Annotated[float, Field(ge=0.0, le=1.0)]
@@ -208,10 +212,20 @@ class OutcomeRule(_Frozen):
                     f"terminal state (present: {sorted(factors)})"
                 )
             total += term.weight * (float(factors[term.factor_id]) - self.threshold)
-        # math.exp overflows around 709; the logistic is saturated long before
-        # that, so clamping the exponent costs no accuracy and removes the
-        # only way this function can raise on well-formed input.
-        exponent = max(-709.0, min(709.0, -self.steepness * total))
+        # The logistic is mathematically open on (0, 1) for every finite
+        # exponent, and float64 is not: at |x| >= 37, `1 + exp(-x)` rounds to
+        # 1.0 and the result lands exactly on a bound. That matters here
+        # because §7.6 drives runs toward states where factors pin at their
+        # bounds, which is precisely where a rule with several strong weights
+        # saturates -- and a terminal score of exactly 0 or 1 asserts certainty
+        # and makes the M7 log-loss infinite for that scenario.
+        #
+        # 36 is the largest magnitude at which the result is still
+        # representably distinct from 1.0 (measured: 1 - 2.22e-16 at 36,
+        # exactly 1.0 at 37). Clamping there keeps the promise ADR-0014 makes
+        # about the range, and it only touches inputs whose value was already
+        # saturated to the bound.
+        exponent = max(-_MAX_LOGIT, min(_MAX_LOGIT, -self.steepness * total))
         return 1.0 / (1.0 + math.exp(exponent))
 
 

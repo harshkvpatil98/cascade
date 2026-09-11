@@ -370,8 +370,20 @@ def test_throttled_200_is_retried_and_then_raises_rate_limited(monkeypatch) -> N
         attempts["n"] += 1
         return httpx.Response(200, text=notice)
 
+    # The clock is frozen and advanced only by a recorded sleep. Without that,
+    # the pacing wait is `interval - (real time since the last request)`, so on
+    # a loaded machine it shrinks by however long the test itself took -- and
+    # the assertion below starts measuring the CPU rather than the backoff.
+    # Measured: this failed a full-suite run under concurrent load.
     slept: list[float] = []
-    monkeypatch.setattr("cascade.corpus.fetch.time.sleep", slept.append)
+    clock = {"now": 1_000.0}
+
+    def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr("cascade.corpus.fetch.time.sleep", fake_sleep)
+    monkeypatch.setattr("cascade.corpus.fetch.time.monotonic", lambda: clock["now"])
 
     fetcher = Fetcher(
         requests_per_second=0.2,
@@ -386,8 +398,7 @@ def test_throttled_200_is_retried_and_then_raises_rate_limited(monkeypatch) -> N
     assert fetcher.throttled == 3
     # `slept` holds both the rate limiter's pacing waits and the retry backoff.
     # The invariant covering both is that nothing waits less than the source's
-    # own interval; the pacing wait is computed by subtraction, so it lands a
-    # float epsilon under 5.0 rather than exactly on it.
+    # own interval.
     interval = 1.0 / 0.2
     assert slept, "a throttled response must produce a wait"
     assert all(wait >= interval - 1e-3 for wait in slept)

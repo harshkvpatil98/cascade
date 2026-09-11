@@ -58,7 +58,31 @@ from cascade.sim.state import WorldState, initial_state, state_hash
 from cascade.trace.events import CausalLedger, DecisionEvent, StepRecord, action_payload
 from cascade.trace.events import event_log_hash as compute_event_log_hash
 
-__all__ = ["Loom", "RunResult", "RunSpec", "mechanics_from", "propagation_from"]
+__all__ = [
+    "STAGE_SEQUENCE",
+    "Loom",
+    "PendingTurn",
+    "RunHandle",
+    "RunResult",
+    "RunSpec",
+    "mechanics_from",
+    "propagation_from",
+]
+
+# The six stages of §7.2, in order, named once. Both drivers read this: the
+# LangGraph graph that runs a single replicate, and the wavefront runner at M6
+# that advances thousands of replicates in lockstep so one step's decisions can
+# be batched. Two drivers over one ordering is the only duplication that is
+# safe here -- the ordering itself is what a divergence would corrupt.
+STAGE_SEQUENCE: tuple[str, ...] = (
+    "stage_exogenous",
+    "stage_arrive",
+    "stage_activate",
+    "stage_observe",
+    "stage_decide",
+    "stage_arbitrate",
+)
+DECIDE_STAGE_INDEX = STAGE_SEQUENCE.index("stage_decide")
 
 Termination = Literal["horizon", "absorbed"]
 
@@ -76,6 +100,26 @@ class RunSpec(BaseModel):
     """``agent`` for the model, or the name of a stand-in (see
     :mod:`cascade.sim.policies`). Written to the ``runs`` table so a run that
     did not involve the agent model can never be mistaken for one that did."""
+
+
+class PendingTurn(BaseModel):
+    """One actor's turn, assembled but not yet decided.
+
+    Produced by the OBSERVE stage and consumed by DECIDE. Splitting them is
+    what lets a runner collect every pending turn across thousands of runs and
+    resolve them in one batch (§12.2) -- the observation is already fixed by
+    the time DECIDE runs, because no actor's decision can change another's
+    observation within a step.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    scenario_id: str
+    actor_id: str
+    observation: Observation
+    memory: str
+    space: ActionSpace
 
 
 class RunResult(BaseModel):
@@ -178,6 +222,7 @@ class _RunContext:
     active: tuple[str, ...] = ()
     eligible: int = 0
     observations: dict[str, Observation] = field(default_factory=dict)
+    turns: dict[str, PendingTurn] = field(default_factory=dict)
     observed_before: dict[str, int] = field(default_factory=dict)
     """Each active actor's *previous* observation step, captured before OBSERVE
     overwrites it -- the window `caused_by` is computed over."""
@@ -185,6 +230,28 @@ class _RunContext:
     caused_by: dict[str, tuple[Any, ...]] = field(default_factory=dict)
     exogenous_delta: dict[str, float] = field(default_factory=dict)
     arrivals: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class RunHandle:
+    """A run in flight, driven a step at a time.
+
+    Opaque on purpose: the context inside it is the kernel's working state, not
+    a boundary type, and a runner that reached into it could advance a run
+    without the stage ordering that makes it reproducible.
+    """
+
+    context: _RunContext
+    pending: bool = False
+    done: bool = False
+
+    @property
+    def spec(self) -> RunSpec:
+        return self.context.spec
+
+    @property
+    def step(self) -> int:
+        return self.context.world.step
 
 
 class _LoopState(TypedDict):
@@ -227,8 +294,8 @@ class Loom:
 
     # -- the run ------------------------------------------------------------
 
-    def run(self, spec: RunSpec) -> RunResult:
-        """Run one replicate to the horizon or to an absorbing state (§7.6)."""
+    def _context(self, spec: RunSpec) -> _RunContext:
+        """Build the working state for one replicate. Seeded, never re-seeded."""
         rng = RunRng.for_run(
             scenario_id=spec.scenario_id,
             config_id=spec.config_id,
@@ -244,6 +311,11 @@ class Loom:
             memories={actor_id: AgentMemory(actor_id=actor_id) for actor_id in self.actor_ids},
             ledger=CausalLedger(),
         )
+        return ctx
+
+    def run(self, spec: RunSpec) -> RunResult:
+        """Run one replicate to the horizon or to an absorbing state (§7.6)."""
+        ctx = self._context(spec)
         final: _LoopState = self._compiled.invoke(
             {"ctx": ctx},
             # Six nodes per step plus the router; the default limit of 25 would
@@ -251,9 +323,12 @@ class Loom:
             # world that still looks like a result.
             {"recursion_limit": self.settings.kernel.steps * 8 + 16, "loom": self},
         )
-        done = final["ctx"]
+        return self._result(final["ctx"])
+
+    def _result(self, done: _RunContext) -> RunResult:
+        """Project a finished context onto the boundary type."""
         return RunResult(
-            spec=spec,
+            spec=done.spec,
             outcome_score=float(self.graph.outcome_rule(done.world.factors)),
             steps_run=len(done.steps),
             termination=done.termination,
@@ -267,6 +342,58 @@ class Loom:
             tokens_in=done.tokens_in,
             tokens_out=done.tokens_out,
         )
+
+    # -- the stepwise driver (M6's wavefront) --------------------------------
+    #
+    # `run` above drives one replicate through the compiled graph. A runner
+    # that wants to batch a step's decisions across many replicates needs to
+    # stop between OBSERVE and DECIDE, which a single graph invocation cannot
+    # do -- so the same stage methods are also exposed as two halves. Both
+    # drivers walk STAGE_SEQUENCE; neither owns any simulation logic.
+
+    def start(self, spec: RunSpec) -> RunHandle:
+        """Open a run without advancing it. The wavefront's constructor."""
+        return RunHandle(self._context(spec))
+
+    def observe_step(self, handle: RunHandle) -> tuple[PendingTurn, ...]:
+        """Advance one run through OBSERVE and return the turns awaiting decisions.
+
+        Deterministic and model-free: everything up to and including the
+        observation is fixed before any actor decides, which is exactly why a
+        step's decisions can be resolved together.
+        """
+        ctx = handle.context
+        if handle.pending:
+            raise RuntimeError(
+                f"run {ctx.spec.run_id} is already waiting on decisions for step "
+                f"{ctx.world.step}; complete the step before observing the next"
+            )
+        for stage in STAGE_SEQUENCE[:DECIDE_STAGE_INDEX]:
+            getattr(self, stage)(ctx)
+        handle.pending = True
+        return tuple(ctx.turns[actor_id] for actor_id in ctx.active)
+
+    def complete_step(self, handle: RunHandle) -> None:
+        """Run DECIDE and ARBITRATE for a step whose turns have been observed."""
+        ctx = handle.context
+        if not handle.pending:
+            raise RuntimeError(
+                f"run {ctx.spec.run_id} has no observed step to complete; "
+                "call observe_step first"
+            )
+        for stage in STAGE_SEQUENCE[DECIDE_STAGE_INDEX:]:
+            getattr(self, stage)(ctx)
+        handle.pending = False
+        handle.done = self.should_continue(ctx) == "stop"
+
+    def result(self, handle: RunHandle) -> RunResult:
+        """Collapse a finished run into its result. Refuses an unfinished one."""
+        if not handle.done:
+            raise RuntimeError(
+                f"run {handle.context.spec.run_id} has not terminated; a partial run "
+                "scored as if complete would enter the ensemble as a real forecast"
+            )
+        return self._result(handle.context)
 
     # -- stages -------------------------------------------------------------
 
@@ -317,7 +444,14 @@ class Loom:
         ctx.eligible = len(self.profiles)
 
     def stage_observe(self, ctx: _RunContext) -> None:
-        """Stage 4: project the world through each active actor's policy."""
+        """Stage 4: project the world, then assemble each active actor's turn.
+
+        The memory digest is refreshed here rather than in DECIDE so that the
+        turn handed to a batching runner is byte-identical to the one DECIDE
+        will use. A second refresh would be idempotent but would leave two
+        places that must agree on the prompt, which is the same class of
+        divergence the single ``STAGE_SEQUENCE`` exists to prevent.
+        """
         ctx.observations = {}
         observed_at = dict(ctx.world.last_observed_at)
         ctx.observed_before = {actor_id: observed_at.get(actor_id, 0) for actor_id in ctx.active}
@@ -332,6 +466,22 @@ class Loom:
             )
             observed_at[actor_id] = ctx.world.step
         ctx.world = ctx.world.model_copy(update={"last_observed_at": observed_at})
+
+        interval = self.settings.kernel.memory.summary_interval
+        ctx.turns = {}
+        for actor_id in ctx.active:
+            observation = ctx.observations[actor_id]
+            memory = ctx.memories[actor_id].maybe_refresh(observation, interval=interval)
+            ctx.memories[actor_id] = memory
+            ctx.turns[actor_id] = PendingTurn(
+                run_id=ctx.spec.run_id,
+                scenario_id=ctx.spec.scenario_id,
+                actor_id=actor_id,
+                observation=observation,
+                memory=memory.render(),
+                space=self.spaces[actor_id],
+            )
+
         # A claim addressed to an actor that did not observe this step is not
         # discarded: it is waiting when that actor next looks. Dropping it
         # would make a signal's effect depend on the scheduler's choice of who
@@ -348,15 +498,16 @@ class Loom:
         ctx.decisions = {}
         ctx.caused_by = {}
         window = self.settings.kernel.memory.recent_observations
-        interval = self.settings.kernel.memory.summary_interval
         for actor_id in ctx.active:
-            observation = ctx.observations[actor_id]
-            memory = ctx.memories[actor_id].maybe_refresh(observation, interval=interval)
+            turn = ctx.turns[actor_id]
+            observation = turn.observation
+            memory = ctx.memories[actor_id]
             decision = self.decider.decide(
+                scenario_id=ctx.spec.scenario_id,
                 actor_id=actor_id,
                 observation=observation,
-                memory=memory.render(),
-                space=self.spaces[actor_id],
+                memory=turn.memory,
+                space=turn.space,
             )
             # Admissibility is re-checked here, not trusted to the decider
             # (ADR-0018). The agent adapter already admits what a model
@@ -514,14 +665,7 @@ def _build_graph() -> Any:
         run_stage.__name__ = name
         return run_stage
 
-    stages = (
-        "stage_exogenous",
-        "stage_arrive",
-        "stage_activate",
-        "stage_observe",
-        "stage_decide",
-        "stage_arbitrate",
-    )
+    stages = STAGE_SEQUENCE
     for stage in stages:
         builder.add_node(stage, node(stage))
     builder.add_edge(START, stages[0])

@@ -145,13 +145,19 @@ cascade compile audit --score  # publish the audit mean; exits 3 below 1.5
 cascade simulate run --scenario ID --replicates N   # seeded runs of one scenario
 cascade simulate activation --runs 50   # measure the §7.3 rate; exits 3 outside the band
 cascade simulate status    # measured figures over the stored runs
+
+cascade simulate all --wave W   # PHASE 2: the fan-out, batching each step (M6)
+cascade simulate estimate --units 20   # §12.4 dry run; exits 2 on a projected breach
+cascade ensemble collapse  # PHASE 3: replicates -> forecasts (label-blind)
+cascade ensemble status    # measured dispersion over the stored forecasts
+cascade ensemble convergence   # §9.3's replicate-count curve
 ```
 
 ---
 
 ## 7. Architecture decisions
 
-Nineteen ADRs in `docs/adr/`. Eleven correct defects found in the spec; the
+Twenty-two ADRs in `docs/adr/`. Twelve correct defects found in the spec; the
 rest record choices the spec left open.
 
 | ADR | Decision | Milestone |
@@ -175,6 +181,9 @@ rest record choices the spec left open.
 | 0017 | `WorldState` carries the alliance pool ledger and the scheduler's per-actor history; §7.1's field list cannot express §7.4's ALLY/DEFECT, §7.3's activation or §7.6's absorption | M5 |
 | 0018 | An action the actor cannot take is coerced to WAIT and the reason recorded on the event, rather than re-prompted (a second call on every occurrence) or executed silently | M5 |
 | 0019 | Evidence is retrieved once per (scenario, actor) into the cached prefix; §7.2 retrieves per step, which is 4.2M searches and ~10x §12.1's 260-token dynamic budget -- and the evidence block is what carries the prefix over the provider's cache floor | M5 |
+| 0020 | The fan-out advances runs in lockstep so one batch serves a whole step: §12.2's discount is functionally required by the ceiling, and per-run submission would need 864,000 batches against an hours-SLA API instead of 24 | M6 |
+| 0021 | The dip test is implemented from its definition with a memoised Monte Carlo uniform null and validated against closed-form cases, rather than transcribing Hartigan's FORTRAN or adding a dependency to the pinned stack | M6 |
+| 0022 | Aggregation runs as `cascade_sim`: §2.2's PHASE 3 / PHASE 4 boundary is enforced by the label grant, so a forecast cannot be conditioned on the outcome it will be scored against | M6 |
 
 ---
 
@@ -871,8 +880,8 @@ Deferred, with reasons:
 - **`retrieval.k_agent` tuning** → M6/M7, when there is a scored answer to tune
   against. Note ADR-0019 makes `k_agent` a per-run cost, not a per-step one.
 
-**Corpus and index state at the close of M5** (M2/M3 work, recorded here
-because it moved). Ingest has continued: the corpus stands at **933,935
+**Corpus and index state at the close of M5** (superseded by the M6 entry;
+kept as the record of what was true then). Ingest has continued: the corpus stands at **933,935
 chunks** across 37 non-empty quarterly partitions, **71.8%** of the 1.30M
 target, up from 587,655 at M4. `cascade corpus verify` still exits 3.
 
@@ -895,3 +904,170 @@ corpus.** They have not been re-measured against 933,935, and p95 is the
 criterion most likely to have moved. Re-run `cascade retrieval index` and then
 `cascade retrieval bench` before quoting them again.
 
+### M6 — Chorus: ensemble at scale · *implemented and tested; all three acceptance criteria blocked on M4's graphs, the mechanism each rests on verified*
+
+Shipped: batch submission in `llm/client.py` (`complete_batch`: cache hits served
+locally, misses submitted as one batch, deduplicated within a wave, polled to
+`ended`, priced at the 50% rate, stored to the same content-addressed cache);
+the kernel's stepwise driver (`start` / `observe_step` / `complete_step` /
+`result`) alongside the LangGraph single-run path, both walking one
+`STAGE_SEQUENCE`; `cascade/ensemble/` — `dip.py` (Hartigan's dip from its
+definition, bimodality coefficient, memoised Monte Carlo null), `aggregate.py`
+(§9.1's collapse, seeded percentile bootstrap, §9.3's convergence curve),
+`runner.py` (the wavefront fan-out, resumable by set difference), `schema.py`,
+`store.py`; migration 010 (`forecasts`, `prompt_revisions`);
+`cascade simulate all|estimate` and `cascade ensemble collapse|status|convergence`;
+ADRs 0020–0022.
+
+**Measured acceptance values.**
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | 36,000 runs complete; event count 4.2M ± 5% | **NOT RUN** — needs 180 compiled graphs (M4, blocked on the credential). The fan-out, its planner and its reporting are implemented; `cascade simulate all` exits **3** naming the missing input | **BLOCKED** |
+| 2 | Action-cache hit rate ≥ 88%; spend within the ceiling | **NOT RUN** for the same reason. The rate is computed over decisions and printed by `simulate all`; the batch path is priced at exactly half the single-call rate, asserted against the meter | **BLOCKED** |
+| 3 | Kill the worker pool mid-phase and resume: no duplicated and no lost runs | **PASS, mechanism, at small scale** — against the live database: a four-replicate plan interrupted after two resumes with exactly the two that did not finish, ends with all four stored, and a re-run of a completed unit adds **zero** events. Not the 36,000-run criterion | **PARTIAL** |
+
+CI: ruff clean, black clean, mypy strict clean (**83 files**). **835 offline
+tests** pass with no services at all, and **942 pass in total** with live
+Postgres and the corpus; M6 added **57**.
+
+**The batch API forces the fan-out's shape, and the shape was the design
+decision.** §12.1 prices the study at ×0.5 batch, and that multiplier is not
+cosmetic: the simulate phase is $126 with it and $252 without, against a $240
+ceiling. So batching is a functional requirement. But the Batches API is
+asynchronous with an SLA in hours, and a step depends on the one before it:
+
+| Submission shape | Batches for the study |
+|---|---|
+| one request per decision | 4,200,000 |
+| one batch per run per step | 864,000 |
+| **one batch per step across all runs** | **24** |
+
+Only the third is a study rather than a geological process, and it requires
+stopping between OBSERVE and DECIDE — which a single LangGraph invocation
+cannot do. The kernel now exposes the step as two halves and the runner
+advances a wave of runs in lockstep (ADR-0020). This is sound because nothing
+in a step's first four stages depends on any decision taken in that step: the
+walk, the arrivals, the activation set and every observation are fixed before
+the first actor decides. **The wavefront reproduces the single-run driver's
+event-log hash byte for byte**, which is asserted from both sides — batching is
+a cost change and must not be a behaviour change.
+
+**The dip test was implemented from its definition and validated, not
+transcribed** (ADR-0021). Adding `diptest` would be a stack substitution for
+one statistic, and a mis-transcribed Hartigan produces a *plausible* p-value,
+which is the worst failure available for the number that tells the study which
+of its forecasts to distrust. Measured against cases with known answers:
+
+| Case | Expected | Measured |
+|---|---|---|
+| 50/50 two-point at the bounds | 0.25 (attainable maximum) | **0.25** |
+| exactly uniform grid, n = 50 / 100 / 200 | 1/(2n) | **1/(2n)** |
+| uniform sample, n = 200 | small | 0.0216, p = 0.14 |
+| two clusters at 0.2 / 0.8, n = 200 | large | 0.1939, p = 0.002 |
+| BC of a uniform / a normal | 5/9 and 1/3 | 0.556 and 0.339 |
+
+The bimodality coefficient is stored beside every forecast and **does not
+vote**: §9.1 defines the flag as sigma-or-dip, and a third statistic quietly
+entering the disjunction would make the reported flag a different thing from
+the specified one.
+
+**Defects found and fixed at M6** (each has a regression test):
+
+- **The bimodality coefficient reported 2.0 — "strongly bimodal" — for a
+  constant ensemble.** The mean of fifty copies of 0.4 is not exactly 0.4 in
+  binary, so the variance lands near 1e-33, the `variance <= 0` guard never
+  fires, and the third and fourth moments come out as noise over noise. A
+  degenerate ensemble is the one a collapsed run *would* produce, so this would
+  have flagged exactly the wrong scenarios. Degeneracy is now detected by
+  range, which is exact.
+- **The Batches API needs `results_url` on the batch object before results can
+  be streamed**, and it is only present once processing has ended. Caught by
+  testing against the real SDK through a mock transport rather than against a
+  hand-built double — the failure appeared inside the SDK, where a fake would
+  never have looked.
+- **Two tests measured the machine rather than the code** (carried over from
+  the M5 close and fixed there): Hypothesis's `too_slow` health check during
+  input generation, and a pacing wait computed by subtracting real elapsed
+  time.
+- **`complete(batch=True)` raised `NotImplementedError` since M0.** It now
+  refuses with the alternative named: submitting one request and waiting hours
+  for it buys half a cent, and the failure it prevents is a 36,000-run phase
+  submitting 36,000 batches.
+
+**Previous-phase issues cleared before M6 started:**
+
+- **The compiler prompt gave `volatility` no scale** (the M5 finding). r2 states
+  the arithmetic: one step is 1/24 of the cutoff-to-resolution interval, sigma
+  is per step in the factor's own [0, 1] units, and an undriven factor wanders
+  about sqrt(24) x sigma over the horizon. It prescribes no value — the
+  resulting activation rate is whatever it measures. Recorded in
+  `prompt_revisions` (migration 010) with both Briers NULL, because this
+  predates the first backtest and §1.3's audit is about revisions made *after*
+  one. `llm.prompt_rev` is now `r2`: the prompt is part of the cache key, so an
+  unchanged rev would serve recordings made against text the model never saw.
+- **`prompt_revisions` did not exist.** It is the third integrity mechanism
+  §1.3 names, alongside the frozen split and the label grant, and it had been
+  deferred since M0.
+- **A pinned-dependency warning on every test run** (langgraph 0.2.x importing a
+  langchain serializer). Ignored by exact warning class, so any other
+  deprecation still surfaces.
+- **A partition created mid-ingest carries a degenerate index until the next
+  pass.** ADR-0012 says an index built on an *empty* partition is permanently
+  degenerate; measured here, the same holds for one built on a nearly-empty
+  partition. `chunks_2017q4` was carrying `lists = 2` against a target of 267
+  on 71,376 rows -- an index built when the partition held about four rows, and
+  a real recall and latency problem rather than ordinary drift.
+  `cascade retrieval index` fixes it in seconds. **The operational rule this
+  implies: run `cascade retrieval index` after ingest stops and before any
+  bench or study run**, not merely "when convenient".
+
+Improvements beyond the roadmap, implemented rather than suggested:
+
+- **`cascade simulate estimate`** implements §12.4's "no full phase launches
+  without it": runs a sample, extrapolates decisions, uncached calls and spend
+  to the full grid, prints the projection against the phase ceiling, and exits
+  **2** on a projected breach. The sample is written like any other run, so the
+  estimate is not wasted work.
+- **Identical requests inside one wave are submitted once.** Replicates that
+  have not diverged produce byte-identical requests; paying twice for them
+  would spend the budget on exactly the duplication the cache exists to
+  exploit.
+- **`cascade ensemble convergence`** implements §9.3's curve over replicate
+  *prefixes* rather than random subsamples -- replicate *k* is a fixed seeded
+  world, so the first 25 are a reproducible ensemble and a resampled 25 would
+  differ between two runs of the report.
+- **Run ids are derived from (scenario, config, replicate)**, so a restarted
+  worker re-simulating a unit collides with itself and the append-only log
+  keeps one copy. A random id would make the M6 event count drift upward with
+  every restart.
+
+Deferred, with reasons:
+
+- **All three acceptance numbers** → 180 compiled graphs, which need
+  `CASCADE_ANTHROPIC_API_KEY`. Everything downstream of the graphs is built and
+  tested; nothing downstream of the *credential* can be measured.
+- **Parquet/DuckDB export** → M7 reads the grid; `duckdb` and `pyarrow` are
+  pinned and still uninstalled, and exporting before there is anything to
+  export would be scaffolding.
+- **Events are written per completed run, not streamed per step.** Fine at the
+  wave sizes a single machine holds; a 36,000-run wave would want streaming,
+  and the row projection is already a pure function.
+- **The worker *pool* is one process.** The wavefront is the parallelism that
+  matters here (it is what makes the batch large); multi-process fan-out adds
+  coordination to a phase whose wall-clock is dominated by the provider's batch
+  SLA.
+
+**Corpus and retrieval state at the close of M6.** Ingest is still running and
+the corpus stands at **1,172,495 chunks** across 37 non-empty quarterly
+partitions -- **90.2%** of the 1.30M target, up from 933,935 at the M5 close.
+`cascade corpus verify` still exits 3.
+
+**The M3 re-benchmark is blocked on the ingest, not on a credential.** It was
+launched and cancelled after two hours: the recall oracle is 500 exhaustive
+searches over a corpus that is growing underneath them, and one partition was
+carrying a degenerate index for part of that window. A p95 measured against a
+moving corpus with drifting indexes measures neither, so the number is not
+worth having yet. **Re-run `cascade retrieval index` and then
+`cascade retrieval bench` once `cascade corpus build` stops**; until then M3's
+acceptance figures remain the ones measured against 409,899 chunks.

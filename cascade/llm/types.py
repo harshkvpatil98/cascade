@@ -15,6 +15,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "BatchFailed",
+    "BatchItem",
     "BudgetExceeded",
     "CacheMiss",
     "CachedCall",
@@ -60,6 +62,25 @@ class BudgetExceeded(LLMError):
         super().__init__(
             f"phase {phase!r} spent ${spent:.6f} against a ${ceiling:.6f} ceiling; "
             f"resumable checkpoint written to {checkpoint}"
+        )
+
+
+class BatchFailed(LLMError):
+    """A submitted batch did not return a usable result for a request.
+
+    Carries the provider's own error type per failed item rather than a
+    summary count: at 36,000 runs the difference between "every request was
+    invalid" and "one expired" decides whether to fix the payload or resubmit.
+    Exit code 1 -- unlike a cache miss, this is not a contract violation, it is
+    a failure the operator has to look at.
+    """
+
+    def __init__(self, failures: dict[str, str]) -> None:
+        self.failures = dict(failures)
+        shown = ", ".join(f"{key}={value}" for key, value in sorted(failures.items())[:5])
+        super().__init__(
+            f"{len(failures)} batch request(s) did not succeed: {shown}"
+            + (" ..." if len(failures) > 5 else "")
         )
 
 
@@ -176,6 +197,19 @@ class LLMResult(_Frozen):
     latency_ms: float
     served_from_cache: bool
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BatchItem(_Frozen):
+    """One request inside a batch submission, with the id it returns under.
+
+    ``custom_id`` is the caller's handle, not the cache key: the Batches API
+    returns results in arbitrary order, so the only safe way to match a result
+    to a request is this id (spec §12.2 assumes batch submission for the whole
+    backtest, which makes the ordering guarantee load-bearing).
+    """
+
+    custom_id: str
+    request: LLMRequest
 
 
 class CachedCall(_Frozen):

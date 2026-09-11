@@ -40,7 +40,13 @@ class AlwaysWait:
     """Decides nothing. Isolates the world's own motion from the agents'."""
 
     def decide(
-        self, *, actor_id: str, observation: Observation, memory: str, space: ActionSpace
+        self,
+        *,
+        scenario_id: str,
+        actor_id: str,
+        observation: Observation,
+        memory: str,
+        space: ActionSpace,
     ) -> Decision:
         return Decision(action=Wait())
 
@@ -50,7 +56,13 @@ class AlwaysIllegal:
     """Always reaches for a lever it does not have (ADR-0018)."""
 
     def decide(
-        self, *, actor_id: str, observation: Observation, memory: str, space: ActionSpace
+        self,
+        *,
+        scenario_id: str,
+        actor_id: str,
+        observation: Observation,
+        memory: str,
+        space: ActionSpace,
     ) -> Decision:
         return Decision(
             action=Escalate(target_factor="not_a_factor_here", magnitude=0.9),
@@ -326,7 +338,13 @@ class AlwaysSignal:
     target: str
 
     def decide(
-        self, *, actor_id: str, observation: Observation, memory: str, space: ActionSpace
+        self,
+        *,
+        scenario_id: str,
+        actor_id: str,
+        observation: Observation,
+        memory: str,
+        space: ActionSpace,
     ) -> Decision:
         if self.target in space.counterparties and space.levers:
             return Decision(
@@ -367,3 +385,28 @@ def test_a_claim_waits_for_a_dormant_target_instead_of_being_dropped(
     for step in carried:
         if step + 1 in steps:
             assert steps[step + 1], "a pending claim was dropped rather than delivered"
+
+
+def test_both_drivers_produce_the_same_run(settings: Settings) -> None:
+    """The compiled graph and the stepwise driver must agree, byte for byte.
+
+    M6 batches a step's decisions across a wave, which needs a driver that can
+    stop between OBSERVE and DECIDE. Two drivers over one `STAGE_SEQUENCE` is
+    safe only while they stay identical, and "identical" here means the event
+    log hashes to the same value -- not that both finish.
+    """
+    graph = make_graph(n_actors=14, n_factors=8)
+    through_graph = build(settings, decider=heuristic_for(graph), graph=graph).run(spec())
+
+    loom = build(settings, decider=heuristic_for(graph), graph=graph)
+    handle = loom.start(spec())
+    turns = 0
+    while not handle.done:
+        turns += len(loom.observe_step(handle))
+        loom.complete_step(handle)
+    stepwise = loom.result(handle)
+
+    assert stepwise.event_log_hash == through_graph.event_log_hash
+    assert stepwise.outcome_score == through_graph.outcome_score
+    assert stepwise.steps_run == through_graph.steps_run
+    assert turns == through_graph.decisions

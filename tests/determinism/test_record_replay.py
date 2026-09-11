@@ -222,18 +222,21 @@ def test_live_without_a_key_fails_loudly(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Deferred surface
+# The batch door
 # ---------------------------------------------------------------------------
 
 
-def test_batch_submission_is_explicitly_deferred(settings: Settings) -> None:
-    """Deferred to M6, and it raises rather than silently costing 2x.
+def test_single_request_batching_is_refused_with_the_alternative(
+    settings: Settings,
+) -> None:
+    """Batching one request buys half a cent and costs hours of latency.
 
-    The meter and the price table already model the 50% discount, so landing
-    it changes the submission path and nothing about the accounting.
+    Landed at M6 as `complete_batch`, which submits a whole wave. This asserts
+    the one-request door stays shut and names the door that is open -- the
+    failure it prevents is a 36,000-run phase submitting 36,000 batches.
     """
     client = LLMClient(in_mode(settings, "replay"), phase="bench")
-    with pytest.raises(NotImplementedError, match="lands at M6"):
+    with pytest.raises(LLMError, match="complete_batch"):
         client.complete(request_for(0), batch=True)
 
 

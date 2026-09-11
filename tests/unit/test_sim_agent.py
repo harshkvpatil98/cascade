@@ -117,7 +117,7 @@ def recording(settings: Settings, tmp_path: Path, transport: Transport) -> LLMAg
     return LLMAgents(
         settings=settings,
         client=client,
-        prepared={"actor_0": prepare_actor(brief(), settings)},
+        prepared={("scenario-1", "actor_0"): prepare_actor(brief(), settings)},
     )
 
 
@@ -154,7 +154,13 @@ def test_the_request_is_tool_enforced_with_two_system_blocks(
 ) -> None:
     transport = Transport()
     agents = recording(settings, tmp_path, transport)
-    agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
+    agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
 
     sent = transport.requests[0]
     assert sent["model"] == settings.models.agent
@@ -168,7 +174,13 @@ def test_the_request_is_tool_enforced_with_two_system_blocks(
 
 def test_a_tool_call_becomes_an_action(settings: Settings, tmp_path: Path) -> None:
     agents = recording(settings, tmp_path, Transport())
-    decision = agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
+    decision = agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
     assert isinstance(decision.action, Commit)
     assert decision.action.target_factor == "factor_0"
     assert decision.coercion is None
@@ -180,7 +192,13 @@ def test_an_answer_with_no_tool_call_costs_one_turn_not_the_run(
 ) -> None:
     transport = Transport(blocks=[{"type": "text", "text": "I would prefer to negotiate."}])
     agents = recording(settings, tmp_path, transport)
-    decision = agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
+    decision = agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
     assert isinstance(decision.action, Wait)
     assert decision.coercion == "no_tool_call"
 
@@ -190,7 +208,13 @@ def test_an_inadmissible_tool_call_is_coerced_and_recorded(
 ) -> None:
     transport = Transport({"type": "ESCALATE", "target_factor": "factor_9", "magnitude": 0.8})
     agents = recording(settings, tmp_path, transport)
-    decision = agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
+    decision = agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
     assert isinstance(decision.action, Wait)
     assert decision.coercion == "no_lever:factor_9"
 
@@ -204,8 +228,20 @@ def test_an_identical_turn_is_served_from_the_cache(settings: Settings, tmp_path
     """
     transport = Transport()
     agents = recording(settings, tmp_path, transport)
-    first = agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
-    second = agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
+    first = agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
+    second = agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
 
     assert not first.cache_hit
     assert second.cache_hit
@@ -217,8 +253,15 @@ def test_an_identical_turn_is_served_from_the_cache(settings: Settings, tmp_path
 def test_a_different_observation_is_a_different_call(settings: Settings, tmp_path: Path) -> None:
     transport = Transport()
     agents = recording(settings, tmp_path, transport)
-    agents.decide(actor_id="actor_0", observation=observation(), memory="", space=SPACE)
     agents.decide(
+        scenario_id="scenario-1",
+        actor_id="actor_0",
+        observation=observation(),
+        memory="",
+        space=SPACE,
+    )
+    agents.decide(
+        scenario_id="scenario-1",
         actor_id="actor_0",
         observation=observation().model_copy(update={"factors": {"factor_0": 0.99}}),
         memory="",
@@ -231,4 +274,10 @@ def test_an_unprepared_actor_is_an_error_not_a_default(settings: Settings, tmp_p
     """A missing persona would otherwise become an agent with no objective."""
     agents = recording(settings, tmp_path, Transport())
     with pytest.raises(KeyError, match="no prepared prompt"):
-        agents.decide(actor_id="ghost", observation=observation(), memory="", space=SPACE)
+        agents.decide(
+            scenario_id="scenario-1",
+            actor_id="ghost",
+            observation=observation(),
+            memory="",
+            space=SPACE,
+        )

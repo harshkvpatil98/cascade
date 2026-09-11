@@ -10,6 +10,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from decimal import Decimal
 from importlib import metadata
 from typing import Annotated, Any, NoReturn
@@ -57,10 +58,15 @@ compile_app = typer.Typer(
 )
 app.add_typer(compile_app, name="compile")
 simulate_app = typer.Typer(
-    help="Loom + Aperture: run seeded simulations of a compiled scenario (M5).",
+    help="Loom + Aperture: run seeded simulations of a compiled scenario (M5/M6).",
     no_args_is_help=True,
 )
 app.add_typer(simulate_app, name="simulate")
+ensemble_app = typer.Typer(
+    help="Chorus: collapse replicates into forecasts and report dispersion (M6).",
+    no_args_is_help=True,
+)
+app.add_typer(ensemble_app, name="ensemble")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -1456,7 +1462,7 @@ def _load_simulation(settings: Settings, scenario_id: str, *, policy: str) -> An
     )
 
     if policy == "agent":
-        decider: Any = _agent_policy(settings, graph, scenario, policies)
+        decider: Any = _agent_policy(settings, [(scenario, graph)])
     else:
         mechanics = mechanics_from(graph)
         from cascade.sim.policies import HeuristicPolicy
@@ -1467,16 +1473,20 @@ def _load_simulation(settings: Settings, scenario_id: str, *, policy: str) -> An
     return Loom(settings=settings, graph=graph, policies=policies, decider=decider), graph
 
 
-def _agent_policy(settings: Settings, graph: Any, scenario: Any, policies: Any) -> Any:
-    """Build the model-backed decider, retrieving each actor's evidence once.
+def _agent_policy(settings: Settings, pairs: Any) -> Any:
+    """Build one model-backed decider covering every (scenario, actor) given.
 
-    Once per (scenario, actor), not once per step (ADR-0019). `as_of` is the
-    scenario cutoff for the whole run, so a per-step query would re-retrieve
-    the same chunks 24 times, cost 4.2M vector searches across the study, and
-    put the dynamic half of the prompt an order of magnitude over the 260
-    tokens §12.1 budgets for it.
+    Evidence is retrieved once per (scenario, actor), not once per step
+    (ADR-0019): `as_of` is the scenario cutoff for the whole run, so a per-step
+    query would re-retrieve the same chunks 24 times, cost 4.2M vector searches
+    across the study, and put the dynamic half of the prompt an order of
+    magnitude over the 260 tokens §12.1 budgets for it.
+
+    One decider for every scenario rather than one each, because the M6
+    wavefront batches a whole step across the wave: a per-scenario decider
+    would turn one submission into 180.
     """
-    from cascade.aperture.policy import counterparties, levers_by_actor
+    from cascade.aperture.policy import counterparties, derive_policies, levers_by_actor
     from cascade.corpus.embed import Embedder
     from cascade.llm.client import LLMClient
     from cascade.retrieval.search import Chronofence
@@ -1488,34 +1498,38 @@ def _agent_policy(settings: Settings, graph: Any, scenario: Any, policies: Any) 
         model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
     )
     embedder.load()
-    levers = levers_by_actor(graph)
-    parties = counterparties(policies)
-    context = f"{scenario.question}\n\nResolution: {scenario.resolution_criterion}"
 
-    prepared = {}
+    prepared: dict[tuple[str, str], Any] = {}
     with Chronofence(settings, role="eval") as fence:
-        for actor in sorted(graph.actors, key=lambda a: a.id):
-            query = f"{scenario.question} {actor.name} {actor.objective}"
-            vector = embedder.encode([query])[0]
-            found = fence.search(vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent)
-            brief = brief_from(
-                actor,
-                levers={
-                    factor: weight
-                    for factor, weight in sorted(_leverage_of(graph, actor.id).items())
-                    if factor in levers.get(actor.id, ())
-                },
-                counterparties=parties.get(actor.id, ()),
-                horizon=settings.kernel.steps,
-                question_context=context,
-                evidence=tuple(
-                    (chunk.published_at.isoformat(), chunk.source, chunk.body)
-                    for chunk in found.chunks
-                ),
+        for scenario, graph in pairs:
+            policies = derive_policies(
+                graph, settings.aperture, asymmetry=settings.flags.information_asymmetry
             )
-            prepared[actor.id] = prepare_actor(brief, settings)
+            levers = levers_by_actor(graph)
+            parties = counterparties(policies)
+            context = f"{scenario.question}\n\nResolution: {scenario.resolution_criterion}"
+            for actor in sorted(graph.actors, key=lambda a: a.id):
+                query = f"{scenario.question} {actor.name} {actor.objective}"
+                vector = embedder.encode([query])[0]
+                found = fence.search(vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent)
+                brief = brief_from(
+                    actor,
+                    levers={
+                        factor: weight
+                        for factor, weight in sorted(_leverage_of(graph, actor.id).items())
+                        if factor in levers.get(actor.id, ())
+                    },
+                    counterparties=parties.get(actor.id, ()),
+                    horizon=settings.kernel.steps,
+                    question_context=context,
+                    evidence=tuple(
+                        (chunk.published_at.isoformat(), chunk.source, chunk.body)
+                        for chunk in found.chunks
+                    ),
+                )
+                prepared[(scenario.scenario_id, actor.id)] = prepare_actor(brief, settings)
 
-    short = sorted(actor_id for actor_id in sorted(prepared) if not prepared[actor_id].cacheable)
+    short = [key for key in sorted(prepared) if not prepared[key].cacheable]
     if short:
         console.print(
             f"[yellow]{len(short)} of {len(prepared)} actor prefixes are below the "
@@ -1779,6 +1793,363 @@ def simulate_status(config: OverlayOpt = None) -> None:
     table.add_row("runs ended by absorption", str(stats.absorbed_runs))
     table.add_row("action-cache hit rate", f"{stats.cache_hit_rate:.4f}")
     table.add_row("distinct event-log hashes", str(stats.distinct_event_hashes))
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# simulate all / estimate: the fan-out (M6, spec §2.2 PHASE 2)
+# ---------------------------------------------------------------------------
+
+# §7.3's derivation: 36,000 runs x 24 steps x 4.86 mean active actors. Printed
+# beside the measurement, never used to produce one.
+TARGET_EVENTS = 4_199_040
+EVENT_TOLERANCE = 0.05
+TARGET_CACHE_HIT_RATE = 0.88
+
+
+def _fanout_wiring(settings: Settings, *, policy: str, scenario_ids: Sequence[str]) -> Any:
+    """Build the pieces a fan-out needs: a decider, a Loom factory, a writer."""
+    from datetime import UTC, datetime
+
+    import numpy as np
+
+    from cascade.aperture.policy import derive_policies
+    from cascade.decompose.schema import graph_hash
+    from cascade.decompose.store import load_graph
+    from cascade.ledger.store import load_scenarios
+    from cascade.sim.kernel import Loom, mechanics_from
+    from cascade.sim.rng import run_seed
+    from cascade.trace.store import write_run
+
+    scenarios = {item.scenario_id: item for item in load_scenarios(settings, role="admin")}
+    graphs: dict[str, Any] = {}
+    pairs = []
+    for scenario_id in scenario_ids:
+        graph = load_graph(settings, scenario_id, role="admin")
+        if graph is None:
+            _fail(
+                f"scenario {scenario_id!r} has no compiled graph; run `cascade compile build`",
+                EXIT_PRECONDITION,
+            )
+        graphs[scenario_id] = graph
+        pairs.append((scenarios[scenario_id], graph))
+
+    shared: Any = _agent_policy(settings, pairs) if policy == "agent" else None
+
+    def loom_for(scenario_id: str) -> Any:
+        graph = graphs[scenario_id]
+        if shared is not None:
+            decider: Any = shared
+        else:
+            from cascade.sim.policies import HeuristicPolicy
+
+            mechanics = mechanics_from(graph)
+            decider = HeuristicPolicy(
+                utility={
+                    actor_id: dict(mechanics[actor_id].utility) for actor_id in sorted(mechanics)
+                }
+            )
+        return Loom(
+            settings=settings,
+            graph=graph,
+            policies=derive_policies(
+                graph, settings.aperture, asymmetry=settings.flags.information_asymmetry
+            ),
+            decider=decider,
+        )
+
+    started = datetime.now(UTC)
+
+    def on_complete(result: Any) -> None:
+        write_run(
+            settings,
+            result,
+            started_at=started,
+            graph_sha256=graph_hash(graphs[result.spec.scenario_id]),
+            run_seed=run_seed(
+                scenario_id=result.spec.scenario_id,
+                config_id=result.spec.config_id,
+                replicate=result.spec.replicate,
+                salt=settings.study.salt,
+            ),
+            numpy_version=np.__version__,
+        )
+
+    return loom_for, on_complete, shared
+
+
+def _print_fanout(report: Any, *, skipped: int, policy: str) -> None:
+    """Print the M6 acceptance figures. Measured, never targeted."""
+    table = Table(title="Fan-out (M6, spec §2.2 PHASE 2)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Criterion", justify="right")
+    table.add_row("runs completed", f"{report.completed:,}", "36,000")
+    table.add_row("runs skipped (already stored)", f"{skipped:,}", "-")
+    table.add_row("decision events", f"{report.decisions:,}", f"{TARGET_EVENTS:,} +/- 5%")
+    table.add_row("decisions / run", f"{report.decisions_per_run:.1f}", "116.6")
+    table.add_row(
+        "action-cache hit rate",
+        f"{report.cache_hit_rate:.4f}" if report.llm_calls else "n/a",
+        f">= {TARGET_CACHE_HIT_RATE:.2f}",
+    )
+    table.add_row("batch submissions", f"{report.batches:,}", "-")
+    table.add_row("turns batched", f"{report.batched_turns:,}", "-")
+    table.add_row("waves / steps", f"{report.waves:,} / {report.steps:,}", "-")
+    table.add_row("elapsed", f"{report.elapsed_s:.1f}s", "-")
+    console.print(table)
+    if policy != "agent":
+        console.print(
+            f"[yellow]policy={policy}[/yellow]: stamped in the runs table and not study data."
+        )
+
+
+@simulate_app.command("all")
+def simulate_all(
+    config: OverlayOpt = None,
+    replicates: Annotated[
+        int | None,
+        typer.Option("--replicates", help="Replicates per scenario; default from config."),
+    ] = None,
+    wave: Annotated[
+        int,
+        typer.Option("--wave", help="Runs advanced in lockstep; larger means fewer batches."),
+    ] = 200,
+    policy: Annotated[str, typer.Option("--policy")] = "agent",
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Use at most N scenarios (smoke runs).")
+    ] = None,
+) -> None:
+    """Run the seeded ensemble across every compiled scenario (M6, PHASE 2).
+
+    Resumable: a run row exists only for a run that finished, so restarting
+    picks up exactly the runs that did not. Costs money in `record` mode and
+    the `simulate` phase ceiling applies -- a breach aborts with exit 2 and
+    every completed run stays written.
+    """
+    from cascade.decompose.store import completed_scenarios
+    from cascade.ensemble.runner import EnsembleRunner
+    from cascade.trace.store import completed_replicates
+
+    settings = _settings(config)
+    if policy not in {"agent", "heuristic"}:
+        _fail(f"unknown policy {policy!r}; expected 'agent' or 'heuristic'", EXIT_PRECONDITION)
+    config_id = config or "base"
+    count = replicates if replicates is not None else settings.ensemble.replicates
+
+    scenario_ids = sorted(completed_scenarios(settings))
+    if not scenario_ids:
+        _fail(
+            "no compiled graphs; run `cascade compile build` before simulating",
+            EXIT_PRECONDITION,
+        )
+    if limit is not None:
+        scenario_ids = scenario_ids[:limit]
+
+    loom_for, on_complete, _ = _fanout_wiring(settings, policy=policy, scenario_ids=scenario_ids)
+    runner = EnsembleRunner(
+        settings=settings,
+        loom_for=loom_for,
+        on_complete=on_complete,
+        policy=policy,
+        completed=lambda scenario_id, cfg: completed_replicates(
+            settings, scenario_id=scenario_id, config_id=cfg
+        ),
+    )
+    tasks, skipped = runner.plan(scenario_ids=scenario_ids, config_id=config_id, replicates=count)
+    console.print(
+        f"{len(scenario_ids)} scenario(s) x {count} replicate(s): "
+        f"[bold]{len(tasks)}[/bold] to run, {skipped} already stored"
+    )
+    if not tasks:
+        return
+    report = runner.execute(tasks, wave=wave)
+    _print_fanout(report, skipped=skipped, policy=policy)
+
+
+@simulate_app.command("estimate")
+def simulate_estimate(
+    config: OverlayOpt = None,
+    units: Annotated[
+        int, typer.Option("--units", help="Sample runs to measure before extrapolating.")
+    ] = 20,
+    replicates: Annotated[int | None, typer.Option("--replicates")] = None,
+    policy: Annotated[str, typer.Option("--policy")] = "agent",
+) -> None:
+    """Measure a sample of runs and extrapolate the phase (spec §12.4).
+
+    "No full phase launches without it." Runs `--units` real runs, then scales
+    what they measured -- decisions, tokens, spend -- to the full grid and
+    compares the projection with the configured ceiling. The sample is written
+    like any other run, so the estimate is not wasted work.
+    """
+    from cascade.decompose.store import completed_scenarios
+    from cascade.ensemble.runner import EnsembleRunner
+    from cascade.trace.store import completed_replicates
+
+    settings = _settings(config)
+    config_id = config or "base"
+    count = replicates if replicates is not None else settings.ensemble.replicates
+    scenario_ids = sorted(completed_scenarios(settings))
+    if not scenario_ids:
+        _fail("no compiled graphs; run `cascade compile build` first", EXIT_PRECONDITION)
+
+    loom_for, on_complete, decider = _fanout_wiring(
+        settings, policy=policy, scenario_ids=scenario_ids
+    )
+    runner = EnsembleRunner(
+        settings=settings,
+        loom_for=loom_for,
+        on_complete=on_complete,
+        policy=policy,
+        completed=lambda scenario_id, cfg: completed_replicates(
+            settings, scenario_id=scenario_id, config_id=cfg
+        ),
+    )
+    tasks, _ = runner.plan(scenario_ids=scenario_ids, config_id=config_id, replicates=count)
+    if not tasks:
+        _fail("nothing left to run; the phase is already complete", EXIT_PRECONDITION)
+
+    sample = tasks[: max(1, units)]
+    report = runner.execute(sample, wave=len(sample))
+    total = len(scenario_ids) * count
+    scale = total / report.completed if report.completed else 0.0
+
+    meter = getattr(getattr(decider, "client", None), "meter", None)
+    spent = Decimal(str(getattr(meter, "total_usd", 0))) if meter is not None else Decimal(0)
+    ceiling = settings.phase_ceiling("simulate")
+
+    table = Table(title="Phase estimate (spec §12.4)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Sampled", justify="right")
+    table.add_column("Projected", justify="right")
+    table.add_row("runs", f"{report.completed:,}", f"{total:,}")
+    table.add_row("decision events", f"{report.decisions:,}", f"{int(report.decisions * scale):,}")
+    table.add_row(
+        "uncached model calls",
+        f"{report.llm_calls - report.cache_hits:,}",
+        f"{int((report.llm_calls - report.cache_hits) * scale):,}",
+    )
+    table.add_row("spend (USD)", f"${spent:.4f}", f"${spent * Decimal(str(scale)):.2f}")
+    table.add_row("ceiling (USD)", "-", f"${ceiling:.2f}")
+    console.print(table)
+    console.print(
+        "[dim]Projected from a sample: the cache hit rate rises as replicates accumulate, "
+        "so a first-runs sample overstates the cost of the rest.[/dim]"
+    )
+    if spent * Decimal(str(scale)) > ceiling:
+        _fail(
+            f"projected ${spent * Decimal(str(scale)):.2f} exceeds the simulate ceiling "
+            f"${ceiling:.2f}; cut replicates before cutting scenarios (spec §15)",
+            EXIT_BUDGET_BREACH,
+        )
+
+
+# ---------------------------------------------------------------------------
+# ensemble: Chorus (M6, spec §9, PHASE 3)
+# ---------------------------------------------------------------------------
+
+
+@ensemble_app.command("collapse")
+def ensemble_collapse(config: OverlayOpt = None) -> None:
+    """Collapse stored runs into forecasts (spec §9.1, PHASE 3).
+
+    Runs as `cascade_sim`, which is the point: collapsing must not be able to
+    see an outcome, and the role that cannot read `scenario_labels` is the one
+    that proves it.
+    """
+    from cascade.ensemble.aggregate import collapse
+    from cascade.ensemble.store import collapse_inputs, write_forecast
+
+    settings = _settings(config)
+    config_id = config or "base"
+    inputs = collapse_inputs(settings, config_id=config_id)
+    if not inputs:
+        _fail(
+            f"no runs stored for config {config_id!r}; run `cascade simulate all` first",
+            EXIT_PRECONDITION,
+        )
+
+    written = 0
+    for item in inputs:
+        forecast = collapse(
+            item.scores,
+            scenario_id=item.scenario_id,
+            config_id=item.config_id,
+            salt=settings.study.salt,
+            sigma_threshold=settings.ensemble.sigma_multimodal_threshold,
+            bootstrap_b=settings.ensemble.bootstrap_b,
+            mean_events=item.mean_events,
+            mean_steps=item.mean_steps,
+            absorbed_runs=item.absorbed_runs,
+        )
+        write_forecast(settings, forecast)
+        written += 1
+    console.print(f"collapsed [bold]{written}[/bold] scenario(s) for config {config_id!r}")
+    _print_forecasts(settings, config_id)
+
+
+@ensemble_app.command("status")
+def ensemble_status(config: OverlayOpt = None) -> None:
+    """Report measured dispersion over the stored forecasts (spec §9.2)."""
+    settings = _settings(config)
+    _print_forecasts(settings, config)
+
+
+def _print_forecasts(settings: Settings, config_id: str | None) -> None:
+    from cascade.ensemble.store import forecast_stats
+
+    stats = forecast_stats(settings, config_id=config_id)
+    table = Table(title="Forecasts (M6, spec §9)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Reference", justify="right")
+    table.add_row("forecasts", f"{stats.forecasts:,}", "180 per config")
+    table.add_row("scenarios", f"{stats.scenarios:,}", "180")
+    table.add_row("configs", ", ".join(stats.configs) or "-", "-")
+    table.add_row("mean p_hat", f"{stats.mean_p_hat:.4f}", "-")
+    table.add_row("mean sigma", f"{stats.mean_sigma:.4f}", "-")
+    table.add_row("multi-modal share", f"{stats.multi_modal_share:.4f}", "~0.31 (§9.2)")
+    table.add_row("mean 95% CI width", f"{stats.mean_ci_width:.4f}", "-")
+    table.add_row("mean replicates", f"{stats.mean_replicates:.1f}", "200")
+    console.print(table)
+
+
+@ensemble_app.command("convergence")
+def ensemble_convergence(config: OverlayOpt = None) -> None:
+    """Print §9.3's replicate-count convergence curve.
+
+    "That plot is what turns 'we ran it 200 times' into 'we ran it 200 times
+    because 200 is where it converges'" -- or, if it has not converged by 200,
+    an honest statement that it has not.
+    """
+    from cascade.ensemble.aggregate import convergence_curve
+    from cascade.ensemble.store import scores_by_scenario
+
+    settings = _settings(config)
+    config_id = config or "base"
+    scores = scores_by_scenario(settings, config_id=config_id)
+    if not scores:
+        _fail(f"no runs stored for config {config_id!r}", EXIT_PRECONDITION)
+
+    curve = convergence_curve(scores)
+    if not curve:
+        _fail(
+            "no scenario has enough replicates to reach the first rung of the curve",
+            EXIT_PRECONDITION,
+        )
+    table = Table(title="Replicate convergence (spec §9.3)")
+    table.add_column("n", justify="right", style="cyan")
+    table.add_column("mean |delta p_hat|", justify="right")
+    table.add_column("mean sigma", justify="right")
+    table.add_column("scenarios", justify="right")
+    for point in curve:
+        table.add_row(
+            str(point.n),
+            f"{point.mean_abs_change:.4f}",
+            f"{point.mean_sigma:.4f}",
+            str(point.scenarios),
+        )
     console.print(table)
 
 

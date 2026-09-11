@@ -40,12 +40,15 @@ class HeuristicPolicy:
     def decide(
         self,
         *,
+        scenario_id: str,
         actor_id: str,
         observation: Observation,
         memory: str,
         space: ActionSpace,
     ) -> Decision:
-        del memory  # a stand-in with a memory would be a model of something
+        # A stand-in with a memory would be a model of something, and it holds
+        # one utility table, so it is built per scenario rather than shared.
+        del memory, scenario_id
         weights = self.utility.get(actor_id, {})
         best: tuple[float, str] | None = None
         for factor_id in sorted(space.levers):

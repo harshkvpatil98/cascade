@@ -21,14 +21,18 @@ Three modes, and the difference between them is the whole point:
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from cascade.canonical import canonical_json
 from cascade.config import Settings
 from cascade.llm.cache import CallCache, cache_key
 from cascade.llm.meter import CostMeter
 from cascade.llm.tracing import Tracer, null_tracer
 from cascade.llm.types import (
+    BatchFailed,
+    BatchItem,
     CachedCall,
     CacheMiss,
     LLMError,
@@ -41,7 +45,19 @@ from cascade.llm.types import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import httpx
 
-__all__ = ["LLMClient", "assert_cacheable_prefix", "estimate_tokens"]
+__all__ = [
+    "BATCH_MAX_REQUESTS",
+    "LLMClient",
+    "assert_cacheable_prefix",
+    "estimate_tokens",
+]
+
+# Provider limits on one batch submission: 100,000 requests or 256 MB. A wave
+# of the M6 fan-out is 36,000 runs x ~4.86 active actors, so a step can exceed
+# the request limit and has to be chunked; the byte limit is checked as the
+# payload is assembled rather than assumed.
+BATCH_MAX_REQUESTS = 100_000
+BATCH_MAX_BYTES = 256 * 1024 * 1024
 
 # Claude tokenises English prose at roughly 3.6 characters per token. The
 # estimator is only used to gate the cacheable prefix (ADR-0001); it is
@@ -139,11 +155,13 @@ class LLMClient:
         is no third outcome that reaches the network.
         """
         if batch:
-            # The meter and the price table already model the 50% discount, so
-            # landing this at M6 changes the submission path and nothing about
-            # the accounting.
-            raise NotImplementedError(
-                "batch submission lands at M6; the cost model already prices it"
+            # One request is not a batch. The Batches API is asynchronous with
+            # an SLA measured in hours, so a single-request submission would
+            # trade minutes of latency for half a cent; `complete_batch` is the
+            # entry point that makes the discount worth having.
+            raise LLMError(
+                "complete(batch=True) submits one request and waits hours for it. "
+                "Use complete_batch() with a whole wave of requests instead."
             )
 
         key = cache_key(request)
@@ -164,6 +182,169 @@ class LLMClient:
             )
 
         return self._call_api(request, key=key, batch=batch, trace_name=trace_name, store=True)
+
+    # -- the batch door (spec §12.2) ----------------------------------------
+
+    def complete_batch(
+        self,
+        items: Sequence[BatchItem],
+        *,
+        trace_name: str = "llm.batch",
+        poll_interval_s: float = 5.0,
+        timeout_s: float = 86_400.0,
+    ) -> dict[str, LLMResult]:
+        """Serve a whole wave of requests, batching whatever the cache misses.
+
+        Returns ``custom_id -> LLMResult`` for every item. Cache hits are
+        served locally and never reach the network, which is what makes the
+        88% hit rate the M6 criterion measures a *saving* rather than a
+        statistic -- only the misses are submitted, and they are submitted at
+        the 50% batch rate the §12.1 cost model assumes.
+
+        Identical requests inside one wave are submitted **once**. Two
+        replicates whose trajectories have not diverged produce byte-identical
+        requests, and paying twice for them would spend the study's budget on
+        the very duplication the cache exists to exploit.
+
+        In ``replay`` a miss raises :class:`CacheMiss`, exactly as
+        :meth:`complete` does: replay never reaches the network by any door.
+        """
+        if self._mode == "live":
+            # `complete` bypasses the cache in live mode, so a batched answer
+            # would be re-requested one call at a time at DECIDE and the wave
+            # would be paid for twice. Live is for the latency benchmark, where
+            # the provider's own round trip is the thing being measured.
+            raise LLMError(
+                "complete_batch is not available in live mode: live bypasses the cache, "
+                "so every batched answer would be requested again at decide time. "
+                "Use record (to pay once and keep the responses) or replay."
+            )
+
+        results: dict[str, LLMResult] = {}
+        pending: dict[str, list[str]] = {}
+        by_key: dict[str, LLMRequest] = {}
+
+        for item in sorted(items, key=lambda entry: entry.custom_id):
+            key = cache_key(item.request)
+            recorded = self.cache.get(key)
+            if recorded is not None:
+                results[item.custom_id] = self._from_recording(recorded, trace_name=trace_name)
+                continue
+            if self._mode == "replay":
+                raise CacheMiss(
+                    f"no recorded response for key {key} (custom_id={item.custom_id!r}, "
+                    f"model={item.request.model!r}, prompt_rev={item.request.prompt_rev!r}) "
+                    f"in {self.cache.root}. Replay never falls back to the network -- "
+                    "re-record with CASCADE_LLM__MODE=record if this call is new."
+                )
+            pending.setdefault(key, []).append(item.custom_id)
+            by_key[key] = item.request
+
+        if not pending:
+            return results
+
+        for chunk in _chunked(sorted(pending), BATCH_MAX_REQUESTS):
+            served = self._run_batch(
+                {key: by_key[key] for key in chunk},
+                trace_name=trace_name,
+                poll_interval_s=poll_interval_s,
+                timeout_s=timeout_s,
+            )
+            for key, result in sorted(served.items()):
+                for custom_id in pending[key]:
+                    results[custom_id] = result
+
+        missing = sorted(set(_flatten(pending)) - set(results))
+        if missing:
+            raise BatchFailed({custom_id: "no result returned" for custom_id in missing})
+        return results
+
+    def _run_batch(
+        self,
+        requests: Mapping[str, LLMRequest],
+        *,
+        trace_name: str,
+        poll_interval_s: float,
+        timeout_s: float,
+    ) -> dict[str, LLMResult]:
+        """Submit one batch keyed by cache key, wait for it, and price the results."""
+        client = self._client()
+        payload = [
+            {"custom_id": _batch_id(key), "params": _batch_params(requests[key])}
+            for key in sorted(requests)
+        ]
+        size = len(canonical_json(payload).encode("utf-8"))
+        if size > BATCH_MAX_BYTES:
+            raise LLMError(
+                f"batch payload is {size} bytes, over the provider's "
+                f"{BATCH_MAX_BYTES}-byte limit; submit fewer requests per wave"
+            )
+
+        started = time.perf_counter()
+        batch = client.messages.batches.create(requests=payload)
+        batch_id = str(getattr(batch, "id", ""))
+        status = str(getattr(batch, "processing_status", ""))
+        while status != "ended":
+            if time.perf_counter() - started > timeout_s:
+                raise LLMError(
+                    f"batch {batch_id} still {status!r} after {timeout_s:.0f}s; "
+                    "the provider's own SLA is 24h -- raise the timeout or cancel it"
+                )
+            self._sleep(poll_interval_s)
+            batch = client.messages.batches.retrieve(batch_id)
+            status = str(getattr(batch, "processing_status", ""))
+
+        out: dict[str, LLMResult] = {}
+        failures: dict[str, str] = {}
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        by_batch_id = {_batch_id(key): key for key in sorted(requests)}
+
+        for entry in client.messages.batches.results(batch_id):
+            key = by_batch_id.get(str(getattr(entry, "custom_id", "")))
+            if key is None:
+                continue
+            outcome = getattr(entry, "result", None)
+            kind = str(getattr(outcome, "type", "")) if outcome is not None else ""
+            if kind != "succeeded":
+                failures[key] = kind or "unknown"
+                continue
+            raw = _message_payload(outcome)
+            usage = _usage_from_payload(raw)
+            result = _result_from_payload(
+                raw, usage=usage, latency_ms=elapsed_ms, served_from_cache=False
+            )
+            # Persist before metering. The meter raises when the phase ceiling
+            # breaks, and a response that has already been paid for must not be
+            # discarded by the abort -- the resumed phase would buy it again.
+            if self._mode == "record":
+                self.cache.put(
+                    CachedCall(
+                        key=key,
+                        request_digest=requests[key].cache_domain(),
+                        raw_response=raw,
+                        usage=usage,
+                        latency_ms=elapsed_ms,
+                        recorded_at=datetime.now(UTC).isoformat(),
+                    )
+                )
+            cost = self.meter.record(model=result.model, usage=usage, batch=True)
+            self._tracer.generation(
+                name=trace_name,
+                model=result.model,
+                usage=usage,
+                cost_usd=cost,
+                cached=False,
+                latency_ms=elapsed_ms,
+            )
+            out[key] = result
+
+        if failures:
+            raise BatchFailed(failures)
+        return out
+
+    def _sleep(self, seconds: float) -> None:
+        """Wait between polls. Isolated so a test can drive the loop instantly."""
+        time.sleep(seconds)
 
     # -- internals ----------------------------------------------------------
 
@@ -279,6 +460,53 @@ class LLMClient:
                 )
             )
         return result
+
+
+def _batch_id(key: str) -> str:
+    """The provider-facing id for a request, derived from its cache key.
+
+    Deriving rather than counting means the id is stable across resubmissions
+    and identical across processes, so a resumed wave that re-submits the same
+    misses lines its results up with the same requests.
+    """
+    return f"k{key[:56]}"
+
+
+def _batch_params(request: LLMRequest) -> dict[str, Any]:
+    """Project a request onto the Batches API's per-item ``params`` object."""
+    params: dict[str, Any] = {
+        "model": request.model,
+        "messages": request.messages,
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+    }
+    if request.system is not None:
+        params["system"] = request.system
+    if request.tools:
+        params["tools"] = request.tools
+    if request.tool_choice is not None:
+        params["tool_choice"] = request.tool_choice
+    return params
+
+
+def _message_payload(outcome: Any) -> dict[str, Any]:
+    """Extract the Messages body from a succeeded batch result entry."""
+    message = getattr(outcome, "message", None)
+    if message is None:
+        raise LLMError("batch result reported success with no message body")
+    if isinstance(message, dict):
+        return dict(message)
+    dumped = message.model_dump(mode="json")
+    return dict(dumped)
+
+
+def _chunked(keys: Sequence[str], size: int) -> Iterator[list[str]]:
+    for start in range(0, len(keys), size):
+        yield list(keys[start : start + size])
+
+
+def _flatten(pending: Mapping[str, list[str]]) -> list[str]:
+    return [custom_id for key in sorted(pending) for custom_id in pending[key]]
 
 
 def _usage_from_payload(raw: dict[str, Any]) -> Usage:

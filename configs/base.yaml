@@ -134,7 +134,11 @@ flags: # ablation switches
 llm:
   mode: replay # record | replay | live -- replay is the safe default
   cache_dir: .cache/llm
-  prompt_rev: "r1"
+  # Bumped to r2 with migration 010: the compiler prompt gained a scale anchor
+  # for `volatility`. prompt_rev is part of the LLM cache key (spec §8.3), so a
+  # changed prompt under an unchanged rev would serve recordings made against
+  # text the model never saw. Every revision is logged in `prompt_revisions`.
+  prompt_rev: "r2"
   max_retries: 2
   timeout_s: 600.0
 

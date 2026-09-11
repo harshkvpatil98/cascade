@@ -111,4 +111,13 @@ markers = [
     # validity checks rather than schema checks, and are reported as such.
     "leakage: time-lock probes against the live corpus (spec §4.2)",
 ]
-filterwarnings = ["error::DeprecationWarning:cascade.*"]
+filterwarnings = [
+    "error::DeprecationWarning:cascade.*",
+    # langgraph 0.2.x imports a langchain serializer at module load and emits a
+    # pending-deprecation warning about a default that changes in a later
+    # release. The stack is pinned to <0.3 (spec §2.3), so the change cannot
+    # reach this study without an ADR, and nothing here constructs the
+    # serializer. Scoped to this one warning class, so any other langchain or
+    # langgraph deprecation still surfaces.
+    "ignore::langchain_core._api.deprecation.LangChainPendingDeprecationWarning",
+]

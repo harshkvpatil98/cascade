@@ -35,6 +35,13 @@ from cascade.decompose.validator import (
     OBJECTIVE_SIMILARITY_MAX,
 )
 
+# Spec §7.2: the simulation advances (resolve_ts - cutoff_ts) / 24 per step.
+# Quoted into the prompt so the compiler can size `volatility` against the
+# horizon it will actually be simulated over, rather than against an unstated
+# scale (see the M6 build-log entry and prompt revision r2).
+SIM_STEPS = 24
+SIM_SQRT_STEPS = 5
+
 __all__ = [
     "CRITIQUE_TOOL",
     "DEFECT_KINDS",
@@ -182,9 +189,22 @@ FACTORS are world variables that move over time. Between {MIN_FACTORS} and
   state                  its value at the cutoff, in [0, 1]
   volatility             sigma of its per-step exogenous random walk, [0, 1]
   inertia                mean-reversion strength, [0, 1]. High inertia means
-                         the factor resists change.
+                         the factor resists change and is pulled back toward
+                         its cutoff value.
   observable_by_default  true for public information (published prices,
                          official statements); false for private state
+
+  On the scale of volatility. The simulation runs {SIM_STEPS} steps between the
+  cutoff and the resolution date, so one step is a {SIM_STEPS}th of that
+  interval -- days or weeks, not months. `volatility` is the standard
+  deviation of ONE step's drift, in the same [0, 1] units as `state`, where 0
+  and 1 are the variable's extremes. Over the whole horizon an undriven factor
+  therefore wanders about sqrt({SIM_STEPS}) x volatility ~ {SIM_SQRT_STEPS} x
+  volatility. Work backwards from how far the real quantity plausibly moves on
+  its own between now and resolution: a factor that could credibly cross most
+  of its range unaided needs a volatility around 0.2, and one a domain expert
+  would call broadly stable over the horizon is well under 0.05. Pick the
+  number this arithmetic implies for each factor rather than a default.
 
 EDGES are signed, lagged influences. src is an actor id or a factor id; dst is
 always a factor id.

@@ -22,6 +22,7 @@ recorded on the run, and never assumed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -30,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from cascade.aperture.projection import Observation
 from cascade.config import Settings
 from cascade.llm.client import estimate_tokens
-from cascade.llm.types import LLMRequest
+from cascade.llm.types import BatchItem, LLMRequest
 from cascade.sim.actions import Action, ActionSpace, Wait, admit
 from cascade.sim.prompts import ACTION_TOOL, ACTION_TOOL_NAME, RULES, ActorBrief, persona_block
 from cascade.sim.prompts import turn_message as render_turn
@@ -62,11 +63,24 @@ class DecisionPolicy(Protocol):
     def decide(
         self,
         *,
+        scenario_id: str,
         actor_id: str,
         observation: Observation,
         memory: str,
         space: ActionSpace,
     ) -> Decision: ...
+
+
+class BatchingPolicy(Protocol):
+    """A decider that can resolve a whole wave of turns before any is decided.
+
+    Optional: the runner checks for it and falls back to one call per turn.
+    This is the seam the 50% batch discount lives in (§12.2) -- the kernel
+    still asks for one decision at a time, and by then every answer is already
+    on disk.
+    """
+
+    def prepare(self, turns: Sequence[Any]) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -102,24 +116,39 @@ class LLMAgents:
 
     settings: Settings
     client: Any
-    prepared: dict[str, PreparedActor]
+    prepared: dict[tuple[str, str], PreparedActor]
+    """(scenario_id, actor_id) -> its cacheable prefix.
+
+    Keyed by both because one instance serves every scenario in a wave, and
+    actor ids are per-graph slugs that repeat across scenarios -- two different
+    parties called ``incumbent_party`` would otherwise share a persona. Serving
+    the whole wave from one decider is what lets a step's misses go out as a
+    single batch instead of one per scenario."""
+
     calls: int = field(default=0)
     cache_hits: int = field(default=0)
 
-    def decide(
+    def build_request(
         self,
         *,
+        scenario_id: str,
         actor_id: str,
         observation: Observation,
         memory: str,
-        space: ActionSpace,
-    ) -> Decision:
-        """Ask the model for one action and admit it (spec §7.2, stage 5)."""
-        actor = self.prepared.get(actor_id)
+    ) -> LLMRequest:
+        """Assemble one turn's request. The single definition of the prompt.
+
+        Shared by :meth:`decide` and :meth:`prepare` on purpose: if the batch
+        path built its own request, a one-character difference would make every
+        batched answer a cache miss at decide time and the study would pay
+        twice for every decision while looking like it worked.
+        """
+        actor = self.prepared.get((scenario_id, actor_id))
         if actor is None:
             raise KeyError(
-                f"no prepared prompt for actor {actor_id!r}; the kernel prepares every "
-                "actor before step 0, so this means the graph and the run disagree"
+                f"no prepared prompt for actor {actor_id!r} of scenario {scenario_id!r}; "
+                "every actor is prepared before step 0, so this means the graph and the "
+                "run disagree"
             )
         persona: dict[str, Any] = {"type": "text", "text": actor.persona}
         if actor.cacheable:
@@ -129,7 +158,7 @@ class LLMAgents:
                 "type": "ephemeral",
                 "ttl": self.settings.prompt_cache.ttl,
             }
-        request = LLMRequest(
+        return LLMRequest(
             model=self.settings.models.agent,
             system=[{"type": "text", "text": RULES}, persona],
             messages=[
@@ -147,6 +176,49 @@ class LLMAgents:
             temperature=self.settings.models.temperature,
             max_tokens=self.settings.models.agent_max_tokens,
             prompt_rev=self.settings.llm.prompt_rev,
+        )
+
+    def prepare(self, turns: Sequence[Any]) -> int:
+        """Resolve a whole wave of turns up front, batching the cache misses.
+
+        Returns the number of turns whose answers are now available locally.
+        Nothing is decided here: this only fills the cache, so the decisions
+        that follow are byte-identical to the ones an unbatched run would make.
+        That equivalence is what lets M6 take the 50% discount without M8's
+        replay hash changing.
+        """
+        if not turns:
+            return 0
+        items = [
+            BatchItem(
+                custom_id=f"{turn.run_id}|{turn.observation.step}|{turn.actor_id}",
+                request=self.build_request(
+                    scenario_id=turn.scenario_id,
+                    actor_id=turn.actor_id,
+                    observation=turn.observation,
+                    memory=turn.memory,
+                ),
+            )
+            for turn in sorted(turns, key=lambda t: (t.scenario_id, t.run_id, t.actor_id))
+        ]
+        self.client.complete_batch(items, trace_name="loom.decide.batch")
+        return len(items)
+
+    def decide(
+        self,
+        *,
+        scenario_id: str,
+        actor_id: str,
+        observation: Observation,
+        memory: str,
+        space: ActionSpace,
+    ) -> Decision:
+        """Ask the model for one action and admit it (spec §7.2, stage 5)."""
+        request = self.build_request(
+            scenario_id=scenario_id,
+            actor_id=actor_id,
+            observation=observation,
+            memory=memory,
         )
         result = self.client.complete(request, trace_name="loom.decide")
         self.calls += 1

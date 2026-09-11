@@ -709,10 +709,10 @@ lines** across 18 modules in `sim/`, `aperture/` and `trace/`.
 | 2 | Mean activation rate 34.7% ± 4 pts on a 50-run sample | **NOT RUN** — the rate is a property of real decompositions and real agents; no graph has been compiled (M4 is blocked on the same credential). `cascade simulate activation` is implemented and exits **3** naming the missing input | **BLOCKED** |
 | 3 | One scenario runs 24 steps end to end; `WorldState` serialization round-trips exactly | Round-trip: **PASS**, exactly — every field equal and `state_hash` equal, on a hand-built awkward-float state and on real run output. End to end: **24/24 steps** on a fixture graph under a stand-in decider, 184 decisions, byte-identical across processes. **Not run on a compiled scenario** | **PARTIAL** |
 
-CI: ruff clean, black clean, mypy strict clean (**78 files**), **786 offline
-tests** pass (754 unit + 13 property + 19 determinism); 885 collected in total,
-99 of them deselected without live services. M5 added **143** tests, of which
-7 are the acceptance properties.
+CI: ruff clean, black clean, mypy strict clean (**78 files**). **885 tests
+pass, 0 fail** — the full suite including integration and leakage against live
+services (16 m 21 s); 786 of them run offline with no services at all. M5 added
+**143** tests, of which 7 are the acceptance properties.
 
 **What blocks criteria 2 and 3, exactly.** Both read off *compiled* graphs,
 which need `CASCADE_ANTHROPIC_API_KEY` (empty here) and ~540 Sonnet calls at

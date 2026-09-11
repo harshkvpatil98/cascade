@@ -651,15 +651,22 @@ CI: ruff clean, black clean, mypy strict clean (**63 files**), **743 tests**
   which is the reason it exists.
 
 **Corpus (M2 criterion 1) — narrowing, not closed.** Ingest of the remaining
-CC-NEWS units is running and has taken the corpus from 409,899 to **474487**
-chunks across **117839** documents. Measured throughput this session is ~1,700
-chunks/minute, so the 1.30M target is roughly eight more hours of continuous
-ingest; the pipeline is resumable per unit, so `cascade corpus build --source
-ccnews` continues from where it stopped. `cascade corpus verify` still exits 3
-while short. Note that a materially larger corpus drifts the IVFFlat `lists`
-sizing — re-run `cascade retrieval index` and `cascade retrieval bench` once
-ingest settles, because ADR-0013 records that recall falls as partitions grow
-at fixed probes.
+CC-NEWS units ran through this session and is still running as it ends. The
+corpus went from 409,899 chunks to **587,655** across **147,839** documents
+(45.2% of target) — that figure is a moving snapshot, not a
+final count. Measured throughput was ~1,700 chunks/minute, so the 1.30M target
+is several more hours of continuous ingest; the pipeline is resumable per unit,
+so `cascade corpus build --source ccnews` picks up where it stopped and
+`cascade corpus verify` keeps exiting 3 until the target is met.
+
+A growing corpus drifts the IVFFlat `lists` sizing, and that drift is not
+cosmetic: ADR-0013 records recall falling as partitions grow at fixed probes.
+It was observed during this session — `tests/integration/test_chronofence.py`
+failed on sizing once the corpus passed ~470k chunks, `cascade retrieval index`
+rebuilt the affected partition, and the suite went green again. **Re-run
+`cascade retrieval index` and then `cascade retrieval bench` once ingest
+settles**, and treat the M3 acceptance numbers as measured against a
+409,899-chunk corpus until that re-run reports otherwise.
 
 Deferred, with reasons:
 - **Every M4 acceptance number** → needs `CASCADE_ANTHROPIC_API_KEY`. Budget is

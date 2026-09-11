@@ -137,6 +137,11 @@ class LLMRequest(_Frozen):
     system: str | list[dict[str, Any]] | None = None
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] | None = None
+    # Pins the model to one tool. Part of the cache domain because it changes
+    # what the model may emit: the same prompt with and without enforcement can
+    # legitimately produce a tool call in one case and prose in the other, and
+    # sharing a key between them would replay prose where a graph was required.
+    tool_choice: dict[str, Any] | None = None
     temperature: float
     max_tokens: int
     prompt_rev: str
@@ -154,6 +159,7 @@ class LLMRequest(_Frozen):
             "system": _strip_cache_control(self.system),
             "messages": _strip_cache_control(self.messages),
             "tools": _strip_cache_control(self.tools),
+            "tool_choice": self.tool_choice,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "prompt_rev": self.prompt_rev,

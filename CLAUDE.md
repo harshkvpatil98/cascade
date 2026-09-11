@@ -135,13 +135,19 @@ cascade retrieval index    # (re)build one IVFFlat index per chunks partition
 cascade retrieval verify   # assert the Chronofence preconditions; exits 3 on drift
 cascade retrieval bench    # p50/p95/p99 + recall@20; exits 3 if a criterion is missed
 cascade retrieval memorization  # the parametric probe (costs money in record mode)
+
+cascade compile build      # draft -> critique -> repair -> validate, per scenario
+cascade compile status     # graph statistics and the repair-retry histogram
+cascade compile verify     # re-validate and re-hash every stored graph; exits 3 on drift
+cascade compile audit      # write the seeded 20-graph audit worksheet (§5.4)
+cascade compile audit --score  # publish the audit mean; exits 3 below 1.5
 ```
 
 ---
 
 ## 7. Architecture decisions
 
-Thirteen ADRs in `docs/adr/`. Seven correct defects found in the spec; the rest
+Fourteen ADRs in `docs/adr/`. Seven correct defects found in the spec; the rest
 record choices the spec left open.
 
 | ADR | Decision | Milestone |
@@ -159,6 +165,7 @@ record choices the spec left open.
 | 0011 | The 512-token chunk cap is verified per chunk, not estimated -- sentence, then word, then character splitting | M2 |
 | 0012 | IVFFlat index lifecycle is an operational command, not a migration -- `lists ≈ sqrt(rows)` is a function of measured data, and an index built on an empty partition is permanently degenerate | M3 |
 | 0013 | `ivfflat.probes` is 40, not the spec's 10: quarterly partitioning fans one query across 36 index scans and probes applies per scan, so the single-index value measures recall@20 = 0.8331 against a > 0.92 criterion | M3 |
+| 0014 | `OutcomeRule` and `UtilityTerm` -- referenced by §5.1 but never defined there -- are declarative, signed and monotone by construction, so §5.3's monotonicity rule holds for any rule that parses | M4 |
 
 ---
 
@@ -558,3 +565,107 @@ Deferred, with reasons:
   automatically.
 - **`retrieval.k_agent` / `k_compiler` tuning** → M4/M5, when there is an agent
   whose answers can be scored against the k it was given.
+
+### M4 — Lathe · *implemented and integration-tested; acceptance run blocked on a credential*
+
+Shipped: `cascade/decompose/` — `schema.py` (the §5.1 `CausalGraph` contract,
+plus `UtilityTerm` and `OutcomeRule` which §5.1 references but never defines,
+see ADR-0014), pure `validator.py` (all six §5.3 rules), `prompts.py` (tool
+schemas generated from the Pydantic models), three-pass `compiler.py`,
+`store.py` and `audit.py`; migration 008 (`causal_graphs`,
+`causal_graph_failures`, grants); `cascade compile build|status|verify|audit`;
+`tool_choice` added to `LLMRequest` and its cache domain.
+
+**Acceptance — not measurable in this environment.** All four criteria are read
+off 180 compiled graphs, and compilation needs ~540 Sonnet calls.
+`CASCADE_ANTHROPIC_API_KEY` is empty here, so no graph has been compiled by a
+model and **no acceptance number in §M4 is claimed**.
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | 180/180 pass the validator within 2 repair attempts; report the retry histogram | **NOT RUN** — histogram is implemented (`causal_graphs.repair_retries`, printed by `compile status`) and has no data |
+| 2 | Mean actor count 14 ± 2; factor count within [4, 12] | **NOT RUN** — bounds are enforced at parse time and by a CHECK constraint; the mean needs real graphs |
+| 3 | Recompiling an unchanged input reproduces the graph hash | **PASS, mechanism only** — asserted on canonical hashing, on emission-order invariance, at the compiler boundary, and against a tampered database row |
+| 4 | Human audit: 20 seeded graphs, mean ≥ 1.5, rubric written to `reports/audit/` | **NOT RUN** — sampler, rubric and scorer are implemented and tested; there are no graphs to sample |
+
+What *is* verified without a model: the full pipeline end to end against the
+live database, with only the LLM stubbed — Chronofence retrieval at the cutoff,
+the real 384-dimension embedder driving the two semantic rules, the upsert, the
+hash round-trip, and the `cascade_sim` grant M5 will read graphs through.
+One integration test pins the rule §5.2 calls the most common failure: the
+pinned model scores a verbatim restatement of the outcome **above** the 0.85
+threshold and an independent interest **below** it, so objective-independence
+catches what it is meant to catch.
+
+CI: ruff clean, black clean, mypy strict clean (**63 files**), **743 tests**
+(634 unit + 12 determinism + 66 integration + 21 leakage + 10 property).
+
+**Design decisions recorded:**
+
+- **`OutcomeRule` is monotone by construction** (ADR-0014). §5.1 names the type
+  and never defines it; §7.2 calls it as `outcome_rule(world.factors) -> [0,1]`
+  and §5.3 requires monotonicity in each factor. A signed-weight logistic makes
+  the partial derivative's sign exactly the sign of the weight everywhere, so
+  the rule cannot parse and be non-monotone. The validator checks it numerically
+  anyway, to catch a future rule form added without re-reading the ADR.
+- **The model never emits `scenario_id`.** The compiler attaches it. A
+  hallucinated or reformatted id would key a graph to the wrong scenario and
+  surface at M7 as a scenario scored against someone else's decomposition.
+- **Tool schemas are generated from the Pydantic models**, never written
+  alongside them, so the schema the model is held to and the schema the
+  validator enforces cannot drift.
+- **A skipped validator rule is not a passed one.** Without an embedder the two
+  semantic rules report as `skipped` and `ValidationReport.ok` is False.
+- **Prompt caching is deliberately off at M4.** Measured: the draft prefix
+  (tool schema + system prompt) is ~3,384 tokens, below the provider's
+  4,096-token floor, where Anthropic silently declines to cache while still
+  charging the write premium (ADR-0001). Padding to reach the floor would buy
+  ~$2 across the milestone in exchange for inflating every call with filler.
+  M5's agent prompts run 36,000 times and are where caching pays.
+
+**Defects found and fixed at M4** (each has a regression test):
+
+- **GDELT's zero contribution was misdiagnosed at M2 and M3.** The DOC 2.0 API
+  serves a rolling recent window, not the archive, and answers anything older
+  with HTTP 200 and the 26-byte body `Invalid query start date.` Measured at
+  the boundary: 2016-01 and 2016-12 refused, **2017-01 returns articles**,
+  2020/2024/2026 fine. `corpus.start_year` is 2016 because that is when
+  CC-NEWS begins, so every GDELT unit this study generated asked for a window
+  the API will never serve — 96 doomed requests per excluded year against a
+  five-second politeness floor, recorded as throttling. `unit_keys` now clamps
+  to `COVERAGE_START_YEAR = 2017`, mirroring what `ccnews.unit_keys` already
+  does for its own collection start. The three stale `failed` rows were
+  removed; a live single-unit run now reaches 2017-01 and fails only on this
+  IP's throttle.
+- **A permanent refusal was retried as a transient one.** `classify_body` had
+  two verdicts, both retried. A third, `rejected`, fails immediately: retrying
+  a refusal the source will never change spends the politeness budget the rest
+  of the ingest needs and reports a fixed configuration error as an outage.
+- **The validator iterated two mappings unsorted** (invariant 7). Both sorted
+  their output, so the result was deterministic, but the static check is
+  deliberately blunt and uniform compliance is what keeps it meaningful.
+- **The test fixture's factor names were near-duplicates.** "Distinct driver
+  number 1/2/3" reads as distinct to a hashing stub and as near-identical to
+  the pinned model, so the fixture passed the orthogonality rule under a fake
+  embedder and failed it under the real one — found by the integration test,
+  which is the reason it exists.
+
+**Corpus (M2 criterion 1) — narrowing, not closed.** Ingest of the remaining
+CC-NEWS units is running and has taken the corpus from 409,899 to **474487**
+chunks across **117839** documents. Measured throughput this session is ~1,700
+chunks/minute, so the 1.30M target is roughly eight more hours of continuous
+ingest; the pipeline is resumable per unit, so `cascade corpus build --source
+ccnews` continues from where it stopped. `cascade corpus verify` still exits 3
+while short. Note that a materially larger corpus drifts the IVFFlat `lists`
+sizing — re-run `cascade retrieval index` and `cascade retrieval bench` once
+ingest settles, because ADR-0013 records that recall falls as partitions grow
+at fixed probes.
+
+Deferred, with reasons:
+- **Every M4 acceptance number** → needs `CASCADE_ANTHROPIC_API_KEY`. Budget is
+  the `compile` phase ceiling ($40); the estimate for 540 Sonnet calls at
+  k_compiler = 60 is roughly $35, which is inside it but not by much.
+- **The M3 parametric probe** (`cascade retrieval memorization`) → same
+  credential.
+- **GDELT ingest** → the adapter is correct and now targets a servable window,
+  but this IP is throttled hard enough that 768 units is impractical from here.

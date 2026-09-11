@@ -244,6 +244,8 @@ class LLMClient:
             payload["system"] = request.system
         if request.tools:
             payload["tools"] = request.tools
+        if request.tool_choice is not None:
+            payload["tool_choice"] = request.tool_choice
 
         started = time.perf_counter()
         message = client.messages.create(**payload)

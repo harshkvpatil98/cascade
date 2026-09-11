@@ -35,9 +35,10 @@ runner = CliRunner()
 CONSOLE_SCRIPT = Path(sys.executable).parent / "cascade"
 
 # Phases still to land. Each must refuse loudly rather than exit 0.
-# `ledger` left the stub list at M1 and `corpus` at M2; both are now sub-apps.
-DEFERRED_PHASES = ["compile", "simulate", "evaluate", "trace", "report"]
-IMPLEMENTED_SUBAPPS = ["ledger", "corpus", "db"]
+# `ledger` left the stub list at M1, `corpus` at M2, `retrieval` arrived at M3
+# and `compile` at M4; all four are now sub-apps.
+DEFERRED_PHASES = ["simulate", "evaluate", "trace", "report"]
+IMPLEMENTED_SUBAPPS = ["ledger", "corpus", "db", "retrieval", "compile"]
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,20 @@ def test_every_spec_subcommand_exists() -> None:
     result = runner.invoke(app, ["--help"])
     for phase in ["doctor", *DEFERRED_PHASES, *IMPLEMENTED_SUBAPPS]:
         assert phase in result.output
+
+
+def test_compile_exposes_the_m4_lifecycle() -> None:
+    """build / status / verify / audit are what an M4 operator needs."""
+    result = runner.invoke(app, ["compile", "--help"])
+    for command in ("build", "status", "verify", "audit"):
+        assert command in result.output
+
+
+def test_retrieval_exposes_the_m3_lifecycle() -> None:
+    """index / bench / verify are what a Chronofence operator needs."""
+    result = runner.invoke(app, ["retrieval", "--help"])
+    for command in ("index", "bench", "verify", "memorization"):
+        assert command in result.output
 
 
 def test_corpus_exposes_the_m2_lifecycle() -> None:
@@ -292,5 +307,5 @@ def test_typer_exit_codes_survive_the_boundary(monkeypatch: pytest.MonkeyPatch) 
     """
     import cascade.cli as cli_module
 
-    monkeypatch.setattr(sys, "argv", ["cascade", "compile"])
+    monkeypatch.setattr(sys, "argv", ["cascade", "simulate"])
     assert cli_module.main() == EXIT_PRECONDITION

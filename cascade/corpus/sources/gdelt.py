@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 
 import httpx
 
-from cascade.corpus.fetch import Fetcher, FetchError, SoftFailure, html_to_text
+from cascade.corpus.fetch import BodyVerdict, Fetcher, FetchError, html_to_text
 from cascade.corpus.schema import RawDocument
 
 __all__ = [
@@ -44,33 +44,50 @@ __all__ = [
 
 DOC_API_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-# Phrases from GDELT's refusal notices. Used only to *label* an unusable body
-# as a throttle rather than to decide whether it is unusable -- see
-# `classify_body` for why that distinction matters.
+# Phrases from GDELT's refusal notices. Used only to *label* an unusable body,
+# never to decide whether it is unusable -- see `classify_body`.
 _THROTTLE_MARKERS = (
     "limit requests to one every",
     "your query is too broad",
     "rate limit",
 )
 
+# Refusals that will never succeed however long the client waits. The DOC 2.0
+# API serves a rolling recent window, not the full GDELT archive, and answers a
+# request outside it with HTTP 200 and this text -- measured against a 2016-01
+# window, which is inside `corpus.start_year`. Retrying these spends the
+# five-second politeness budget proving the answer will not change, and
+# records a fixed configuration problem as an outage.
+_PERMANENT_MARKERS = (
+    "invalid query start date",
+    "invalid query end date",
+    "invalid date",
+    "invalid query",
+    "unrecognized query",
+)
 
-def classify_body(response: httpx.Response) -> SoftFailure | None:
+
+def classify_body(response: httpx.Response) -> BodyVerdict | None:
     """Classify a GDELT 2xx body: ``None`` when it is a real answer.
 
     Every request this module makes carries ``format=json``, so **a 200 whose
     body is not JSON is not an answer**, whatever the reason. That is the test
-    applied here, and it is deliberately not a search for known error strings.
+    that decides *whether* the body is usable, and it is deliberately not a
+    search for known error strings -- enumerating a third party's error prose
+    is a losing game, while the shape of a valid answer is something this
+    client actually knows.
 
-    A marker whitelist was tried first and proved too narrow within one ingest
-    run: two of the three failing units were correctly identified as throttled,
-    while the third came back with a 200 carrying a body that matched no known
-    phrase and was recorded, once again, as ``returned non-JSON``. Enumerating
-    a third party's error prose is a losing game -- the shape of a *valid*
-    answer is the thing this client actually knows.
+    The markers decide only *what kind* of non-answer it is, because the three
+    kinds call for different handling:
 
-    The markers survive only to distinguish "throttled" (worth waiting for)
-    from "unusable" (retried, but not evidence of impatience), because those
-    two mean different things in an ingest report.
+    * ``throttled`` -- wait and retry; the same request succeeds later.
+    * ``rejected``  -- never retry. The DOC 2.0 API serves a rolling recent
+      window and answers anything older with ``Invalid query start date.``
+      under HTTP 200. All three GDELT units in this corpus failed that way and
+      were diagnosed as throttling, which is why the source contributed zero
+      and why the M2 log recorded the wrong cause.
+    * ``unusable``  -- retry; an HTML error page or a truncated body may be
+      transient.
     """
     if response.status_code == 429:
         return "throttled"
@@ -83,6 +100,8 @@ def classify_body(response: httpx.Response) -> SoftFailure | None:
         return None
 
     head = response.text[:512].lower()
+    if any(marker in head for marker in _PERMANENT_MARKERS):
+        return "rejected"
     if any(marker in head for marker in _THROTTLE_MARKERS):
         return "throttled"
     return "unusable"
@@ -104,11 +123,32 @@ QUERIES: tuple[str, ...] = (
 )
 
 
+# The DOC 2.0 API serves a rolling window over GDELT's recent index, not the
+# full archive. Measured against the live service: a 2016-01 window and a
+# 2016-12 window are both refused with HTTP 200 and "Invalid query start date.",
+# while 2020-06 returns articles normally. GDELT documents the API's coverage as
+# beginning 2017-01-01, which matches.
+#
+# `corpus.start_year` is 2016 because that is when CC-NEWS begins; generating
+# GDELT units from it asks for windows this API will never serve. That is the
+# same failure `ccnews.unit_keys` already guards against by refusing to
+# generate months before the collection exists -- a known gap turned into a
+# stream of fetch failures that read as an outage. All three GDELT units in
+# this corpus failed exactly this way and were diagnosed as throttling.
+COVERAGE_START_YEAR = 2017
+
+
 def unit_keys(*, start_year: int, end_year: int) -> list[str]:
-    """One unit per month per query."""
+    """One unit per month per query, clamped to the API's coverage window.
+
+    Months before :data:`COVERAGE_START_YEAR` are not generated. Asking for
+    them produces a permanent refusal per unit per query -- 96 doomed requests
+    per excluded year against a five-second politeness floor.
+    """
+    first = max(start_year, COVERAGE_START_YEAR)
     return [
         f"{year:04d}-{month:02d}:{index}"
-        for year in range(start_year, end_year + 1)
+        for year in range(first, end_year + 1)
         for month in range(1, 13)
         for index in range(len(QUERIES))
     ]

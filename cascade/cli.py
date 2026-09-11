@@ -52,6 +52,10 @@ retrieval_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(retrieval_app, name="retrieval")
+compile_app = typer.Typer(
+    help="Lathe: compile scenarios into typed causal graphs (M4).", no_args_is_help=True
+)
+app.add_typer(compile_app, name="compile")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -235,12 +239,6 @@ def _not_yet(name: str, milestone: str) -> None:
         "Milestones are executed strictly in order (spec §14.1)."
     )
     raise typer.Exit(EXIT_PRECONDITION)
-
-
-@app.command()
-def compile(config: OverlayOpt = None) -> None:
-    """Compile scenarios into typed causal graphs (M4)."""
-    _not_yet("compile", "M4")
 
 
 @app.command()
@@ -1030,6 +1028,393 @@ def _sim_role_is_fenced(settings: Settings) -> tuple[bool, str]:
     except psycopg.OperationalError as exc:
         return False, f"cannot connect as cascade_sim: {exc}"
     return True, "denied on chunks and documents"
+
+
+# ---------------------------------------------------------------------------
+# compile: Lathe, the causal decomposition compiler (M4)
+# ---------------------------------------------------------------------------
+
+
+def _lathe(settings: Settings) -> Any:
+    """Wire the compiler to the real model, embedder and corpus.
+
+    Retrieval goes through Chronofence as `eval` rather than `sim`: compilation
+    is an offline preparation step, not part of a run, and the role separation
+    that matters here is the time lock -- which `chronofence_search` enforces
+    identically for both roles.
+    """
+    from cascade.corpus.embed import Embedder
+    from cascade.decompose.compiler import Lathe
+    from cascade.llm.client import LLMClient
+    from cascade.retrieval.search import Chronofence
+
+    embedder = Embedder(
+        model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
+    )
+    embedder.load()
+
+    fence = Chronofence(settings, role="eval")
+    fence.__enter__()
+
+    def retrieve(question: str, as_of: Any, k: int) -> list[tuple[str, str, str]]:
+        vector = embedder.encode([question])[0]
+        result = fence.search(vector, as_of=as_of, k=k)
+        return [
+            (chunk.published_at.isoformat(), chunk.source, chunk.body) for chunk in result.chunks
+        ]
+
+    compiler = Lathe(
+        settings=settings,
+        client=LLMClient(settings, phase="compile"),
+        embed=embedder.encode,
+        retrieve=retrieve,
+    )
+    return compiler, fence
+
+
+def _require_api_key(settings: Settings) -> None:
+    """Fail before spending anything if the credential is absent.
+
+    Checked here rather than left to the SDK: a 180-scenario compile that dies
+    on scenario 20 has already spent real money, and the operator needs to know
+    which variable to set before it starts.
+    """
+    key = settings.anthropic_api_key
+    if settings.llm.mode != "replay" and (key is None or not key.get_secret_value().strip()):
+        _fail(
+            f"llm.mode={settings.llm.mode!r} needs CASCADE_ANTHROPIC_API_KEY, which is unset "
+            "or empty. Set it in .env, or replay a recorded compile with "
+            "CASCADE_LLM__MODE=replay",
+            EXIT_PRECONDITION,
+        )
+
+
+def _print_compile_stats(stats: Any, settings: Settings) -> None:
+    """Print the M4 acceptance figures. Measured, never targeted."""
+    table = Table(title="Causal graphs (M4)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Required", justify="right")
+    table.add_column("", width=3)
+
+    def row(name: str, measured: str, required: str, ok: bool) -> None:
+        table.add_row(name, measured, required, "[green]OK[/green]" if ok else "[red]NO[/red]")
+
+    row(
+        "graphs compiled",
+        f"{stats.compiled:,}/{stats.scenarios:,}",
+        f"{stats.scenarios:,}",
+        stats.compiled == stats.scenarios and stats.scenarios > 0,
+    )
+    row("hard failures", f"{stats.failed:,}", "0", stats.failed == 0)
+    row(
+        "mean actors",
+        f"{stats.mean_actors:.2f}" if stats.compiled else "-",
+        "14 +/- 2",
+        bool(stats.compiled) and 12.0 <= stats.mean_actors <= 16.0,
+    )
+    row(
+        "actor range",
+        f"{stats.min_actors}-{stats.max_actors}" if stats.compiled else "-",
+        "8-20",
+        bool(stats.compiled) and stats.min_actors >= 8 and stats.max_actors <= 20,
+    )
+    row(
+        "mean factors",
+        f"{stats.mean_factors:.2f}" if stats.compiled else "-",
+        "-",
+        True,
+    )
+    row(
+        "factor range",
+        f"{stats.min_factors}-{stats.max_factors}" if stats.compiled else "-",
+        "4-12",
+        bool(stats.compiled) and stats.min_factors >= 4 and stats.max_factors <= 12,
+    )
+    row(
+        "distinct graph hashes",
+        f"{stats.distinct_hashes:,}",
+        f"{stats.compiled:,}",
+        stats.distinct_hashes == stats.compiled,
+    )
+    row("mean edges", f"{stats.mean_edges:.1f}" if stats.compiled else "-", "-", True)
+    row(
+        "mean evidence chunks",
+        f"{stats.mean_evidence_chunks:.1f}" if stats.compiled else "-",
+        f"{settings.retrieval.k_compiler}",
+        True,
+    )
+    row("total LLM calls", f"{stats.total_llm_calls:,}", "-", True)
+    console.print(table)
+
+    if stats.retry_histogram:
+        histogram = Table(title="Repair retries")
+        histogram.add_column("Retries", style="cyan", justify="right")
+        histogram.add_column("Graphs", justify="right")
+        histogram.add_column("Share", justify="right")
+        histogram.add_column("", overflow="crop")
+        for retries, count in stats.retry_histogram:
+            share = count / max(1, stats.compiled)
+            histogram.add_row(str(retries), f"{count:,}", f"{share:6.2%}", "#" * round(share * 40))
+        console.print(histogram)
+
+
+@compile_app.command("build")
+def compile_build(
+    config: OverlayOpt = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Compile at most N pending scenarios.")
+    ] = None,
+    rebuild: Annotated[
+        bool,
+        typer.Option("--rebuild", help="Recompile scenarios that already have a graph."),
+    ] = False,
+) -> None:
+    """Compile scenarios into typed causal graphs (M4, spec §5).
+
+    Resumable: scenarios already compiled are skipped unless --rebuild is
+    given, so an interrupted run continues rather than paying for 180 scenarios
+    again. Costs money in `record` mode; the `compile` phase ceiling applies.
+    """
+    from cascade.decompose.store import (
+        compile_stats,
+        completed_scenarios,
+        record_failure,
+        write_graph,
+    )
+    from cascade.ledger.store import load_scenarios
+
+    settings = _settings(config)
+    _require_api_key(settings)
+
+    scenarios = load_scenarios(settings, role="admin")
+    if not scenarios:
+        _fail("scenario registry is empty; run `cascade ledger build` first", EXIT_PRECONDITION)
+
+    done = set() if rebuild else completed_scenarios(settings)
+    pending = [item for item in scenarios if item.scenario_id not in done]
+    if limit is not None:
+        pending = pending[:limit]
+
+    console.print(
+        f"compiling [bold]{len(pending)}[/bold] scenario(s); "
+        f"{len(scenarios) - len(pending)} already done"
+    )
+
+    compiler, fence = _lathe(settings)
+    compiled = failed = 0
+    try:
+        for index, scenario in enumerate(pending, start=1):
+            outcome = compiler.compile_scenario(scenario)
+            if outcome.ok:
+                write_graph(settings, outcome)
+                compiled += 1
+                marker = f"[green]ok[/green] retries={outcome.repair_retries}"
+            else:
+                record_failure(settings, outcome)
+                failed += 1
+                marker = f"[red]failed[/red] {'; '.join(outcome.violations)[:90]}"
+            console.print(f"  [{index}/{len(pending)}] {scenario.scenario_id}: {marker}")
+    finally:
+        fence.__exit__(None, None, None)
+
+    console.print(f"compiled [bold]{compiled}[/bold], failed [bold]{failed}[/bold]")
+    _print_compile_stats(compile_stats(settings, expected_scenarios=len(scenarios)), settings)
+    if failed:
+        _fail(
+            f"{failed} scenario(s) could not be compiled within the retry budget", EXIT_PRECONDITION
+        )
+
+
+@compile_app.command("status")
+def compile_status(config: OverlayOpt = None) -> None:
+    """Report measured graph statistics and the repair-retry histogram."""
+    from cascade.decompose.store import compile_stats
+
+    settings = _settings(config)
+    _print_compile_stats(compile_stats(settings), settings)
+
+
+@compile_app.command("verify")
+def compile_verify(config: OverlayOpt = None) -> None:
+    """Assert every stored graph is valid and hashes to its recorded digest.
+
+    Re-runs the full §5.3 validator against what is actually in the database,
+    not against what the compiler believed at write time. Exits 3 on any
+    violation, hash mismatch, or missing scenario.
+    """
+    from cascade.corpus.embed import Embedder
+    from cascade.decompose.store import compile_stats, verify_hashes
+    from cascade.decompose.validator import validate
+    from cascade.ledger.store import load_scenarios
+
+    settings = _settings(config)
+    failures: list[str] = []
+
+    mismatches = verify_hashes(settings)
+    if mismatches:
+        failures.append(
+            f"{len(mismatches)} stored graph(s) do not match their recorded hash: "
+            + ", ".join(item.scenario_id for item in mismatches[:5])
+        )
+
+    scenarios = {item.scenario_id: item for item in load_scenarios(settings, role="admin")}
+    stats = compile_stats(settings)
+
+    embedder = Embedder(
+        model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
+    )
+    invalid: list[str] = []
+    if stats.compiled:
+        embedder.load()
+        from cascade.decompose.store import load_graphs
+
+        for graph in load_graphs(settings, role="admin"):
+            scenario = scenarios.get(graph.scenario_id)
+            if scenario is None:
+                invalid.append(f"{graph.scenario_id}: no such scenario in the registry")
+                continue
+            outcome_text = f"{scenario.question} {scenario.resolution_criterion}".strip()
+            report = validate(graph, outcome_text=outcome_text, embed=embedder.encode)
+            if not report.ok:
+                invalid.append(f"{graph.scenario_id}: {report.render() or 'checks skipped'}")
+
+    table = Table(title="Causal graph preconditions")
+    table.add_column("Check", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("", width=3)
+
+    def row(name: str, measured: str, ok: bool) -> None:
+        table.add_row(name, measured, "[green]OK[/green]" if ok else "[red]NO[/red]")
+
+    row(
+        "graphs stored",
+        f"{stats.compiled:,}/{stats.scenarios:,}",
+        stats.compiled == stats.scenarios,
+    )
+    row(
+        "hash matches content",
+        f"{stats.compiled - len(mismatches):,}/{stats.compiled:,}",
+        not mismatches,
+    )
+    row(
+        "passes the §5.3 validator",
+        f"{stats.compiled - len(invalid):,}/{stats.compiled:,}",
+        not invalid,
+    )
+    row("hard failures logged", f"{stats.failed:,}", stats.failed == 0)
+    console.print(table)
+
+    if invalid:
+        for line in invalid[:10]:
+            err_console.print(f"  [red]{line}[/red]")
+        failures.append(f"{len(invalid)} stored graph(s) fail the validator")
+    if stats.compiled == 0:
+        failures.append("no graphs are stored; run `cascade compile build`")
+    if stats.failed:
+        failures.append(f"{stats.failed} scenario(s) are logged as hard failures")
+
+    if failures:
+        _fail("; ".join(failures), EXIT_PRECONDITION)
+    console.print("[bold green]causal graphs: all preconditions hold[/bold green]")
+
+
+@compile_app.command("audit")
+def compile_audit(
+    config: OverlayOpt = None,
+    score: Annotated[
+        bool,
+        typer.Option("--score", help="Score a completed worksheet instead of writing one."),
+    ] = False,
+) -> None:
+    """Write or score the seeded 20-graph human audit (spec §5.4).
+
+    Without --score, samples 20 graphs and writes `rubric.md` and
+    `worksheet.json` under `reports/audit/` for a human to fill in. With
+    --score, reads the completed worksheet and publishes the mean; exits 3 when
+    the mean is below the §5.4 threshold, because a compiler below it cannot be
+    fixed by tuning anything downstream.
+    """
+    from pathlib import Path
+
+    from cascade.decompose.audit import (
+        PASS_THRESHOLD,
+        sample_scenarios,
+        score_worksheet,
+        summarise,
+        write_worksheet,
+    )
+    from cascade.decompose.store import load_graph
+    from cascade.ledger.store import load_scenarios
+
+    settings = _settings(config)
+    directory = Path(settings.paths.reports) / "audit"
+
+    if score:
+        worksheet = directory / "worksheet.json"
+        if not worksheet.is_file():
+            _fail(
+                f"no worksheet at {worksheet}; run `cascade compile audit` first", EXIT_PRECONDITION
+            )
+        scores = score_worksheet(worksheet)
+        summary = summarise(scores)
+
+        table = Table(title="Graph audit (spec §5.4)")
+        table.add_column("Axis", style="cyan")
+        table.add_column("Mean", justify="right")
+        for axis, mean in summary.per_axis:
+            table.add_row(axis, f"{mean:.3f}")
+        table.add_row("[bold]overall[/bold]", f"[bold]{summary.mean:.3f}[/bold]")
+        console.print(table)
+        console.print(f"scored [bold]{summary.scored}[/bold] graph(s); threshold {PASS_THRESHOLD}")
+        if summary.worst:
+            console.print(
+                "lowest scoring: " + ", ".join(f"{sid} ({m:.2f})" for sid, m in summary.worst)
+            )
+
+        if summary.scored == 0:
+            _fail("worksheet has no completed scores", EXIT_PRECONDITION)
+        if not summary.passed:
+            _fail(
+                f"audit mean {summary.mean:.3f} is below {PASS_THRESHOLD}; per §5.4 the "
+                "compiler prompt is the problem and simulation tuning will not fix it",
+                EXIT_PRECONDITION,
+            )
+        console.print("[bold green]audit: mean meets the §5.4 threshold[/bold green]")
+        return
+
+    scenarios = {item.scenario_id: item for item in load_scenarios(settings, role="admin")}
+    if not scenarios:
+        _fail("scenario registry is empty", EXIT_PRECONDITION)
+
+    chosen = sample_scenarios(sorted(scenarios), salt=settings.study.salt)
+    graphs = []
+    missing = []
+    for scenario_id in chosen:
+        graph = load_graph(settings, scenario_id, role="admin")
+        if graph is None:
+            missing.append(scenario_id)
+            continue
+        graphs.append((scenario_id, scenarios[scenario_id].question, graph))
+
+    if missing:
+        _fail(
+            f"{len(missing)} sampled scenario(s) have no compiled graph: "
+            + ", ".join(missing[:5])
+            + " -- run `cascade compile build` first",
+            EXIT_PRECONDITION,
+        )
+
+    rubric_path, worksheet_path = write_worksheet(
+        directory, graphs=graphs, salt=settings.study.salt
+    )
+    console.print(f"sampled [bold]{len(graphs)}[/bold] graph(s), seeded from the study salt")
+    console.print(f"  rubric:    {rubric_path}")
+    console.print(f"  worksheet: {worksheet_path}")
+    console.print(
+        "[dim]Fill in every score, then run `cascade compile audit --score`. "
+        "The graphs are shown without their outcomes on purpose (§5.4).[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------

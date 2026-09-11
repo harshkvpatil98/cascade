@@ -464,3 +464,111 @@ def test_rate_limited_is_a_fetch_error() -> None:
     from cascade.corpus.fetch import FetchError, RateLimited
 
     assert issubclass(RateLimited, FetchError)
+
+
+# ---------------------------------------------------------------------------
+# Permanent refusals
+#
+# Regression: GDELT's DOC 2.0 API serves a rolling recent window, not the full
+# archive, and answers anything older with HTTP 200 and the body
+# "Invalid query start date." -- 26 bytes. `corpus.start_year` is 2016, so
+# every GDELT unit in this study asks for a window the API will never serve.
+# Classified as merely "unusable", each was retried three times and then
+# recorded as throttled, which is why the source contributed zero documents and
+# why the M2 build log recorded an IP block as the cause.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Invalid query start date.\n",
+        "Invalid query end date.",
+        "INVALID QUERY START DATE.",
+        "Unrecognized query.",
+    ],
+)
+def test_a_permanent_refusal_is_classified_as_rejected(body: str) -> None:
+    import httpx
+
+    assert gdelt.classify_body(httpx.Response(200, text=body)) == "rejected"
+
+
+def test_a_throttle_is_still_distinguished_from_a_permanent_refusal() -> None:
+    """The two call for opposite handling; conflating them is the original bug."""
+    import httpx
+
+    assert (
+        gdelt.classify_body(
+            httpx.Response(200, text="Please limit requests to one every 5 seconds.")
+        )
+        == "throttled"
+    )
+
+
+def test_a_rejected_body_is_not_retried(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Retrying a permanent refusal spends the budget the ingest needs."""
+    import httpx
+
+    from cascade.corpus.fetch import SourceRejected
+
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(200, text="Invalid query start date.\n")
+
+    slept: list[float] = []
+    monkeypatch.setattr("cascade.corpus.fetch.time.sleep", slept.append)
+
+    fetcher = Fetcher(
+        requests_per_second=0.2,
+        max_retries=3,
+        classify_body=gdelt.classify_body,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SourceRejected) as caught:
+        fetcher.get_json("https://api.gdeltproject.org/x?startdatetime=20160101000000")
+
+    assert attempts["n"] == 1, "a permanent refusal must be asked exactly once"
+    assert slept == [], "a permanent refusal must not trigger backoff"
+    assert fetcher.throttled == 0, "a rejection is not evidence of impatience"
+    assert "Invalid query start date" in str(caught.value)
+
+
+def test_source_rejected_is_a_fetch_error_but_not_a_rate_limit() -> None:
+    """Existing handlers keep catching it; the two stay tellable apart."""
+    from cascade.corpus.fetch import FetchError, RateLimited, SourceRejected
+
+    assert issubclass(SourceRejected, FetchError)
+    assert not issubclass(SourceRejected, RateLimited)
+    assert not issubclass(RateLimited, SourceRejected)
+
+
+def test_gdelt_units_start_where_the_api_coverage_does() -> None:
+    """Regression: the root cause of GDELT contributing zero documents.
+
+    `corpus.start_year` is 2016 because that is when CC-NEWS begins. The DOC
+    2.0 API serves from 2017-01-01, and refuses anything earlier permanently.
+    Generating 2016 units produced 96 doomed requests per excluded year against
+    a five-second politeness floor, and the failures were read as throttling.
+
+    This mirrors `ccnews.unit_keys`, which already refuses to generate months
+    before its collection exists, for the same reason.
+    """
+    keys = gdelt.unit_keys(start_year=2016, end_year=2024)
+    assert keys[0] == "2017-01:0"
+    assert not any(key.startswith("2016") for key in keys)
+    assert len(keys) == 8 * 12 * len(gdelt.QUERIES)
+
+
+def test_gdelt_units_are_not_clamped_when_the_request_starts_later() -> None:
+    """The floor must not override a caller asking for a narrower window."""
+    keys = gdelt.unit_keys(start_year=2020, end_year=2021)
+    assert keys[0] == "2020-01:0"
+    assert keys[-1] == "2021-12:7"
+
+
+def test_gdelt_coverage_floor_is_the_measured_one() -> None:
+    """2016-12 was refused and 2020-06 served; the documented start is 2017-01-01."""
+    assert gdelt.COVERAGE_START_YEAR == 2017

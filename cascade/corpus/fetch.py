@@ -24,7 +24,14 @@ from typing import Any, Literal
 
 import httpx
 
-__all__ = ["FetchError", "Fetcher", "RateLimited", "SoftFailure", "html_to_text"]
+__all__ = [
+    "BodyVerdict",
+    "FetchError",
+    "Fetcher",
+    "RateLimited",
+    "SourceRejected",
+    "html_to_text",
+]
 
 # Why a 2xx response is nevertheless not an answer.
 #
@@ -34,7 +41,14 @@ __all__ = ["FetchError", "Fetcher", "RateLimited", "SoftFailure", "html_to_text"
 #   type it was asked for: an HTML error page, a truncated body, a notice in
 #   prose. Also retried, because the alternative is handing it to a parser
 #   that will report the source's problem as this client's bug.
-SoftFailure = Literal["throttled", "unusable"]
+# "rejected"  -- the source understood the request and will never fulfil it:
+#   a window outside its archive, a malformed parameter, an unsupported query.
+#   **Not retried.** Retrying a permanent refusal spends the politeness budget
+#   the rest of the ingest needs and reports a fixed configuration error as an
+#   outage. Measured: GDELT answers a 2016 date range with HTTP 200 and the
+#   body "Invalid query start date.", which three units retried three times
+#   each before being recorded as throttled.
+BodyVerdict = Literal["throttled", "unusable", "rejected"]
 
 # SEC EDGAR rejects requests whose User-Agent does not carry a contact address
 # in "Name email@domain" form -- measured: a descriptive-but-address-free agent
@@ -77,6 +91,16 @@ _BLOCK_ELEMENTS = frozenset(
 
 class FetchError(RuntimeError):
     """A source returned something unusable."""
+
+
+class SourceRejected(FetchError):
+    """The source refused the request permanently; retrying cannot help.
+
+    Separate from :class:`RateLimited` because the two call for opposite
+    responses. A throttle is about timing and the same request succeeds later.
+    A rejection is about the request itself -- the fix is upstream, in whatever
+    generated it, and the ingest should say so rather than back off.
+    """
 
 
 class RateLimited(FetchError):
@@ -166,7 +190,7 @@ class Fetcher:
     # unit's cause of death. The hook lives here because backoff and politeness
     # live here; what one source's refusal looks like stays in that source's
     # module.
-    classify_body: Callable[[httpx.Response], SoftFailure | None] | None = None
+    classify_body: Callable[[httpx.Response], BodyVerdict | None] | None = None
     _last_request: float = field(default=0.0, init=False)
 
     def _http(self) -> httpx.Client:
@@ -236,6 +260,13 @@ class Fetcher:
                     )
                     if verdict is None:
                         return response
+                    if verdict == "rejected":
+                        # Permanent. Fail now rather than spending the retry
+                        # budget proving the answer will not change.
+                        self.failures += 1
+                        raise SourceRejected(
+                            f"{url} was refused by the source: " f"{response.text[:200].strip()!r}"
+                        )
                     if verdict == "throttled":
                         self.throttled += 1
                         rate_limited = True

@@ -172,7 +172,13 @@ def test_every_field_in_the_key_domain_changes_the_key(field: str, value: Any) -
 
 
 def test_the_key_domain_is_exactly_the_documented_fields() -> None:
-    """A field added to the request must be a deliberate corpus invalidation."""
+    """A field added to the request must be a deliberate corpus invalidation.
+
+    `tool_choice` joined the domain at M4. It belongs there: the same prompt
+    with and without tool enforcement can legitimately produce a tool call in
+    one case and prose in the other, so sharing a key between them would
+    replay prose where a graph was required.
+    """
     assert sorted(make_request().cache_domain()) == [
         "max_tokens",
         "messages",
@@ -180,6 +186,7 @@ def test_the_key_domain_is_exactly_the_documented_fields() -> None:
         "prompt_rev",
         "system",
         "temperature",
+        "tool_choice",
         "tools",
     ]
 

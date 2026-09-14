@@ -40,6 +40,14 @@ class Forecast(BaseModel):
     mean_events: float = 0.0
     mean_steps: float = 0.0
     absorbed_runs: int = 0
+    policy: Literal["agent", "heuristic", "mixed", "none"] = "agent"
+    """Which decider produced the runs behind this forecast.
+
+    M5 stamps the policy on a run because "a footnote is not a mechanism; the
+    column is". The same holds one level up: a Brier over forecasts collapsed
+    from a stand-in decider is a mechanism check, not a study result, and
+    nothing downstream could tell the difference without this field. ``mixed``
+    is a defect state, reported rather than silently resolved."""
 
     @property
     def ci_width(self) -> float:

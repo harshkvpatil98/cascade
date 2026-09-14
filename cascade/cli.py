@@ -7,20 +7,28 @@ CI-checkable.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from decimal import Decimal
 from importlib import metadata
-from typing import Annotated, Any, NoReturn
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from cascade.config import Settings, load_settings
+from cascade.config import Settings, load_settings, repo_root
 from cascade.llm.types import BudgetExceeded, CacheMiss, PromptTooShortToCache
+
+if TYPE_CHECKING:  # pragma: no cover -- types only, never imported at startup
+    from cascade.eval.schema import MetricSet, ScoredForecast
+    from cascade.eval.store import FrozenSplit
+
 from cascade.version import (
     EXIT_BUDGET_BREACH,
     EXIT_CACHE_MISS,
@@ -67,6 +75,11 @@ ensemble_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(ensemble_app, name="ensemble")
+eval_app = typer.Typer(
+    help="Assay: score forecasts, run the ablation grid, test significance (M7).",
+    no_args_is_help=True,
+)
+app.add_typer(eval_app, name="eval")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -260,20 +273,24 @@ def _not_yet(name: str, milestone: str) -> None:
 
 @app.command()
 def evaluate(config: OverlayOpt = None) -> None:
-    """Score forecasts, run the ablation grid, write metrics (M7)."""
-    _not_yet("evaluate", "M7")
+    """Deprecated alias. The evaluation harness is `cascade eval` (M7).
+
+    Kept as a command rather than deleted because the spec's §13 command list
+    names it, and a removed subcommand fails with click's "no such command",
+    which does not say where the thing went.
+    """
+    err_console.print(
+        "[yellow]`cascade evaluate` is now `cascade eval`[/yellow] -- try "
+        "`cascade eval status`, `cascade eval score`, `cascade eval grid`, "
+        "`cascade eval significance`, or `cascade report`."
+    )
+    raise typer.Exit(EXIT_PRECONDITION)
 
 
 @app.command()
 def trace(config: OverlayOpt = None) -> None:
     """Walk the provenance chain from an outcome to its root cause (M8)."""
     _not_yet("trace", "M8")
-
-
-@app.command()
-def report(config: OverlayOpt = None) -> None:
-    """Write the study report artifact (M7/M9)."""
-    _not_yet("report", "M7/M9")
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +461,87 @@ def corpus_status(config: OverlayOpt = None) -> None:
 
     settings = _settings(config)
     _print_corpus_stats(corpus_stats(settings), settings.corpus.target_chunks)
+
+
+@corpus_app.command("coverage")
+def corpus_coverage(
+    config: OverlayOpt = None,
+    worst: Annotated[
+        int, typer.Option("--worst", help="How many under-covered scenarios to list.")
+    ] = 15,
+) -> None:
+    """Measure evidence availability at each scenario's own cutoff (M2/M3).
+
+    The chunk count says the corpus is big. This says whether it is in the
+    right years: a 2026 scenario whose nearest admissible document is from
+    2017 is retrieved correctly, quickly, and uselessly. Exits 3 when any
+    scenario falls below `corpus.coverage_min_chunks` in its window, so a
+    corpus over its size target but concentrated in the wrong span cannot
+    pass as covered.
+    """
+    from statistics import median
+
+    from cascade.corpus.store import scenario_coverage
+
+    settings = _settings(config)
+    corpus = settings.corpus
+    rows = scenario_coverage(settings, lookback_months=corpus.coverage_lookback_months)
+    if not rows:
+        _fail("no scenarios in the registry -- run `cascade ledger build`", EXIT_PRECONDITION)
+
+    under = [row for row in rows if row.under_covered(corpus.coverage_min_chunks)]
+    stale = [row.staleness_days for row in rows if row.staleness_days is not None]
+    windowed = [row.chunks_in_window for row in rows]
+
+    summary = Table(title=f"Evidence coverage ({corpus.coverage_lookback_months}-month window)")
+    summary.add_column("Quantity", style="cyan")
+    summary.add_column("Measured", justify="right")
+    summary.add_column("Required", justify="right")
+    summary.add_column("")
+    summary.add_row("scenarios", f"{len(rows):,}", "-", "OK")
+    summary.add_row(
+        "fully covered",
+        f"{len(rows) - len(under):,}",
+        f"{len(rows):,}",
+        "OK" if not under else "SHORT",
+    )
+    summary.add_row(
+        "median chunks in window",
+        f"{int(median(windowed)):,}" if windowed else "0",
+        f">= {corpus.coverage_min_chunks:,}",
+        "OK" if windowed and median(windowed) >= corpus.coverage_min_chunks else "SHORT",
+    )
+    summary.add_row("min chunks in window", f"{min(windowed):,}" if windowed else "0", "-", "")
+    summary.add_row("median staleness (days)", f"{int(median(stale)):,}" if stale else "-", "-", "")
+    summary.add_row("max staleness (days)", f"{max(stale):,}" if stale else "-", "-", "")
+    console.print(summary)
+
+    if under:
+        worst_first = sorted(under, key=lambda row: (row.chunks_in_window, row.scenario_id))[:worst]
+        detail = Table(title=f"Under-covered scenarios ({len(under)} of {len(rows)})")
+        detail.add_column("Scenario", style="cyan", overflow="fold")
+        detail.add_column("cutoff")
+        detail.add_column("in window", justify="right")
+        detail.add_column("before cutoff", justify="right")
+        detail.add_column("latest admissible")
+        detail.add_column("stale (days)", justify="right")
+        for row in worst_first:
+            detail.add_row(
+                row.scenario_id,
+                row.cutoff_ts.date().isoformat(),
+                f"{row.chunks_in_window:,}",
+                f"{row.chunks_before_cutoff:,}",
+                str(row.latest_admissible) if row.latest_admissible else "none",
+                str(row.staleness_days) if row.staleness_days is not None else "-",
+            )
+        console.print(detail)
+        _fail(
+            f"{len(under)} of {len(rows)} scenarios have fewer than "
+            f"{corpus.coverage_min_chunks:,} admissible chunks within "
+            f"{corpus.coverage_lookback_months} months of their cutoff",
+            EXIT_PRECONDITION,
+        )
+    console.print("[bold green]corpus: every scenario is covered at its cutoff[/bold green]")
 
 
 @corpus_app.command("verify")
@@ -1434,6 +1532,23 @@ ACTIVATION_TARGET = 0.347
 ACTIVATION_TOLERANCE = 0.04
 
 
+def _graph_for(settings: Settings, scenario_id: str) -> Any:
+    """The graph this configuration simulates -- compiled, or the generic panel.
+
+    Appendix C's factor A. With `causal_decomposition: false` there is no
+    compiled decomposition to run, so the kernel is given a generic persona
+    panel instead (ADR-0025). Returns ``None`` when decomposition is on and no
+    graph has been compiled, so every caller can report the missing input in
+    its own words.
+    """
+    from cascade.decompose.store import load_graph
+    from cascade.eval.panel import panel_graph
+
+    if not settings.flags.causal_decomposition:
+        return panel_graph(scenario_id, actors=settings.flags.panel_actors)
+    return load_graph(settings, scenario_id, role="admin")
+
+
 def _load_simulation(settings: Settings, scenario_id: str, *, policy: str) -> Any:
     """Wire a Loom for one scenario: graph, policies, and whatever decides.
 
@@ -1442,11 +1557,10 @@ def _load_simulation(settings: Settings, scenario_id: str, *, policy: str) -> An
     Chronofence either way, so the time lock is identical.
     """
     from cascade.aperture.policy import derive_policies
-    from cascade.decompose.store import load_graph
     from cascade.ledger.store import load_scenarios
     from cascade.sim.kernel import Loom, mechanics_from
 
-    graph = load_graph(settings, scenario_id, role="admin")
+    graph = _graph_for(settings, scenario_id)
     if graph is None:
         _fail(
             f"scenario {scenario_id!r} has no compiled graph; run `cascade compile build` first",
@@ -1473,6 +1587,23 @@ def _load_simulation(settings: Settings, scenario_id: str, *, policy: str) -> An
     return Loom(settings=settings, graph=graph, policies=policies, decider=decider), graph
 
 
+@contextmanager
+def _maybe_chronofence(settings: Settings, *, enabled: bool) -> Iterator[Any]:
+    """Open a Chronofence, or yield ``None`` under `grounding: parametric_only`.
+
+    A context manager rather than a conditional at each call site so the
+    ungrounded arm cannot accidentally hold an open connection to the corpus
+    it is meant not to read.
+    """
+    if not enabled:
+        yield None
+        return
+    from cascade.retrieval.search import Chronofence
+
+    with Chronofence(settings, role="eval") as fence:
+        yield fence
+
+
 def _agent_policy(settings: Settings, pairs: Any) -> Any:
     """Build one model-backed decider covering every (scenario, actor) given.
 
@@ -1485,22 +1616,35 @@ def _agent_policy(settings: Settings, pairs: Any) -> Any:
     One decider for every scenario rather than one each, because the M6
     wavefront batches a whole step across the wave: a per-scenario decider
     would turn one submission into 180.
+
+    Appendix C's factor C lives here. Under `grounding: parametric_only` no
+    retrieval happens at all -- no embedder is loaded and no Chronofence
+    connection is opened -- and every actor's prefix carries an explicit
+    statement that evidence was withheld rather than an empty section the
+    model would have to interpret. That arm also loses the cache floor: the
+    evidence block is what carries the prefix over 4,096 tokens (ADR-0019), so
+    parametric cells are legitimately more expensive per call, and the warning
+    below reports it rather than hiding it.
     """
     from cascade.aperture.policy import counterparties, derive_policies, levers_by_actor
-    from cascade.corpus.embed import Embedder
     from cascade.llm.client import LLMClient
-    from cascade.retrieval.search import Chronofence
     from cascade.sim.agent import LLMAgents, prepare_actor
     from cascade.sim.prompts import brief_from
 
     _require_api_key(settings)
-    embedder = Embedder(
-        model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
-    )
-    embedder.load()
+    grounded = settings.flags.grounding == "chronofence"
+    if grounded:
+        from cascade.corpus.embed import Embedder
+
+        embedder: Any = Embedder(
+            model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
+        )
+        embedder.load()
+    else:
+        embedder = None
 
     prepared: dict[tuple[str, str], Any] = {}
-    with Chronofence(settings, role="eval") as fence:
+    with _maybe_chronofence(settings, enabled=grounded) as fence:
         for scenario, graph in pairs:
             policies = derive_policies(
                 graph, settings.aperture, asymmetry=settings.flags.information_asymmetry
@@ -1509,9 +1653,18 @@ def _agent_policy(settings: Settings, pairs: Any) -> Any:
             parties = counterparties(policies)
             context = f"{scenario.question}\n\nResolution: {scenario.resolution_criterion}"
             for actor in sorted(graph.actors, key=lambda a: a.id):
-                query = f"{scenario.question} {actor.name} {actor.objective}"
-                vector = embedder.encode([query])[0]
-                found = fence.search(vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent)
+                if fence is None or embedder is None:
+                    evidence: tuple[tuple[str, str, str], ...] = ()
+                else:
+                    query = f"{scenario.question} {actor.name} {actor.objective}"
+                    vector = embedder.encode([query])[0]
+                    found = fence.search(
+                        vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent
+                    )
+                    evidence = tuple(
+                        (chunk.published_at.isoformat(), chunk.source, chunk.body)
+                        for chunk in found.chunks
+                    )
                 brief = brief_from(
                     actor,
                     levers={
@@ -1522,10 +1675,8 @@ def _agent_policy(settings: Settings, pairs: Any) -> Any:
                     counterparties=parties.get(actor.id, ()),
                     horizon=settings.kernel.steps,
                     question_context=context,
-                    evidence=tuple(
-                        (chunk.published_at.isoformat(), chunk.source, chunk.body)
-                        for chunk in found.chunks
-                    ),
+                    evidence=evidence,
+                    grounded=grounded,
                 )
                 prepared[(scenario.scenario_id, actor.id)] = prepare_actor(brief, settings)
 
@@ -1815,7 +1966,6 @@ def _fanout_wiring(settings: Settings, *, policy: str, scenario_ids: Sequence[st
 
     from cascade.aperture.policy import derive_policies
     from cascade.decompose.schema import graph_hash
-    from cascade.decompose.store import load_graph
     from cascade.ledger.store import load_scenarios
     from cascade.sim.kernel import Loom, mechanics_from
     from cascade.sim.rng import run_seed
@@ -1825,7 +1975,7 @@ def _fanout_wiring(settings: Settings, *, policy: str, scenario_ids: Sequence[st
     graphs: dict[str, Any] = {}
     pairs = []
     for scenario_id in scenario_ids:
-        graph = load_graph(settings, scenario_id, role="admin")
+        graph = _graph_for(settings, scenario_id)
         if graph is None:
             _fail(
                 f"scenario {scenario_id!r} has no compiled graph; run `cascade compile build`",
@@ -2082,6 +2232,7 @@ def ensemble_collapse(config: OverlayOpt = None) -> None:
             mean_events=item.mean_events,
             mean_steps=item.mean_steps,
             absorbed_runs=item.absorbed_runs,
+            policy=item.policy,
         )
         write_forecast(settings, forecast)
         written += 1
@@ -2151,6 +2302,1168 @@ def ensemble_convergence(config: OverlayOpt = None) -> None:
             str(point.scenarios),
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# eval: Assay (M7, spec §10)
+# ---------------------------------------------------------------------------
+
+
+def _frozen_split(settings: Settings) -> FrozenSplit:
+    """Assert §1.3's frozen split before a single label is read.
+
+    Every path under `cascade eval` goes through here first. The assertion is
+    worth nothing if it happens once the numbers are already out, so it happens
+    before them -- and a mismatch exits 3 rather than warning, because the
+    correct response to a moved split is never to carry on.
+    """
+    from cascade.eval.store import SplitNotSealed, assert_frozen_split
+    from cascade.ledger.manifest import ManifestMismatch
+
+    try:
+        return assert_frozen_split(settings)
+    except SplitNotSealed as exc:
+        _fail(str(exc), EXIT_PRECONDITION)
+    except ManifestMismatch as exc:
+        _fail(str(exc), EXIT_PRECONDITION)
+
+
+def _paired_direct_brier(
+    settings: Settings, scored: Sequence[ScoredForecast], config_id: str
+) -> float | None:
+    """The single-model baseline's Brier **on the scenarios this config scored**.
+
+    §10.2 makes the direct baseline the reference the headline skill score is
+    stated against. The headline runs all 180 scenarios, so for it the paired
+    and unpaired references coincide -- but a §10.3-capped cell runs 90, and
+    comparing its Brier over 90 scenarios against the baseline's over 180 would
+    be a skill score between two different populations, reported as if it were
+    one. Restricting the reference to the overlap makes the ratio mean what it
+    says.
+
+    ``None`` when the baseline has not been produced, or when the overlap is
+    empty -- both are "not measured", never zero.
+    """
+    from cascade.eval.baselines import DIRECT_CONFIG_ID
+    from cascade.eval.metrics import brier
+    from cascade.eval.store import scored_forecasts
+
+    if config_id == DIRECT_CONFIG_ID:
+        return None
+    reference = {
+        item.scenario_id: item for item in scored_forecasts(settings, config_id=DIRECT_CONFIG_ID)
+    }
+    shared = sorted({item.scenario_id for item in scored} & set(reference))
+    if not shared:
+        return None
+    return brier(
+        [reference[key].p_hat for key in shared], [reference[key].outcome for key in shared]
+    )
+
+
+def _metrics_for_config(
+    settings: Settings, config_id: str, split: FrozenSplit
+) -> tuple[MetricSet | None, tuple[ScoredForecast, ...]]:
+    """Score one configuration, or return ``(None, ())`` when it has none."""
+    from cascade.eval.score import metrics_for
+    from cascade.eval.store import scored_forecasts
+
+    scored = scored_forecasts(settings, config_id=config_id)
+    if not scored:
+        return None, ()
+    return (
+        metrics_for(
+            scored,
+            config_id=config_id,
+            climatology_brier=split.climatology_brier,
+            direct_brier=_paired_direct_brier(settings, scored, config_id),
+            salt=split.study_salt,
+        ),
+        scored,
+    )
+
+
+def _print_metrics(metrics: Any, *, title: str) -> None:
+    table = Table(title=title)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Note", overflow="fold")
+    table.add_row("scenarios scored", f"{metrics.n:,}", "the denominator of every row below")
+    table.add_row(
+        "decider policy",
+        ", ".join(metrics.policies),
+        "'agent' is study data; 'none' is a model-free baseline; "
+        "'heuristic'/'mixed' are mechanism checks",
+    )
+    table.add_row("base rate", f"{metrics.base_rate:.4f}", "of the scored subset")
+    table.add_row("mean forecast", f"{metrics.mean_p_hat:.4f}", "")
+    table.add_row("Brier", f"{metrics.brier:.6f}", "headline; lower is better")
+    table.add_row(
+        "BSS vs climatology",
+        (
+            "not measured"
+            if metrics.bss_vs_climatology is None
+            else f"{metrics.bss_vs_climatology:.4f}"
+        ),
+        "1 - BS/BS_climatology",
+    )
+    table.add_row(
+        "BSS vs single-model",
+        "not measured" if metrics.bss_vs_direct is None else f"{metrics.bss_vs_direct:.4f}",
+        "the §10.2 reference",
+    )
+    table.add_row("log loss", f"{metrics.log_loss:.6f}", "p clipped to [0.01, 0.99]")
+    table.add_row(
+        "AUC", "not measured" if metrics.auc is None else f"{metrics.auc:.4f}", "mid-ranks"
+    )
+    table.add_row("ECE / MCE", f"{metrics.ece:.4f} / {metrics.mce:.4f}", "10 equal-width bins")
+    table.add_row(
+        "Murphy REL - RES + UNC",
+        f"{metrics.murphy.reliability:.6f} - {metrics.murphy.resolution:.6f} "
+        f"+ {metrics.murphy.uncertainty:.6f}",
+        f"binning residual {metrics.murphy.residual:+.6f}",
+    )
+    if metrics.brier_recalibrated is not None:
+        table.add_row(
+            "Brier (isotonic, held out)",
+            f"{metrics.brier_recalibrated:.6f}",
+            "secondary; the headline is the raw system",
+        )
+    console.print(table)
+    if metrics.provisional:
+        console.print(
+            f"[yellow]These forecasts were produced by "
+            f"{', '.join(metrics.policies)} decider(s), not the study's agents.[/yellow] "
+            "The numbers above verify the harness end to end; they are not a result."
+        )
+
+
+@eval_app.command("score")
+def eval_score(
+    config: OverlayOpt = None,
+    config_id: Annotated[
+        str | None, typer.Option("--config-id", help="Which stored config to score.")
+    ] = None,
+) -> None:
+    """Score one configuration's stored forecasts against the sealed labels.
+
+    Runs as `cascade_eval` and asserts the frozen split first (§1.3). Exits 3
+    when the configuration has no forecasts -- a Brier over nothing is not a
+    small number, it is not a number.
+    """
+    settings = _settings(config)
+    split = _frozen_split(settings)
+    target = config_id or config or "C01"
+    metrics, scored = _metrics_for_config(settings, target, split)
+    if metrics is None:
+        from cascade.eval.store import available_configs
+
+        stored = ", ".join(f"{name} ({count})" for name, count in available_configs(settings))
+        _fail(
+            f"no stored forecasts for config {target!r}; stored configs are: {stored or 'none'}",
+            EXIT_PRECONDITION,
+        )
+    console.print(
+        f"frozen split [bold]{split.manifest_sha256[:16]}...[/bold] "
+        f"({split.n_scenarios} scenarios, base rate {split.base_rate:.4f})"
+    )
+    _print_metrics(metrics, title=f"Metrics -- {target} (spec §10.1)")
+    _print_calibration(scored)
+    _print_domains(scored)
+
+
+def _fmt_optional(value: float | None, pattern: str) -> str:
+    """Render a measurement, or a dash where there is not one.
+
+    A bin with no scenarios has no mean forecast. Printing 0.0000 would put a
+    measurement in the table that nobody made.
+    """
+    return "-" if value is None else pattern.format(value)
+
+
+def _print_calibration(scored: Any) -> None:
+    from cascade.eval.score import calibration_of
+
+    report = calibration_of(scored)
+    table = Table(title="Calibration (spec §10.5)")
+    table.add_column("bin", style="cyan")
+    table.add_column("n", justify="right")
+    table.add_column("mean pred", justify="right")
+    table.add_column("observed", justify="right")
+    table.add_column("Wilson 95%", justify="right")
+    for row in report.bins:
+        if row.count == 0:
+            table.add_row(f"[{row.lo:.1f}, {row.hi:.1f})", "0", "-", "-", "-")
+            continue
+        table.add_row(
+            f"[{row.lo:.1f}, {row.hi:.1f})",
+            str(row.count),
+            _fmt_optional(row.mean_pred, "{:.4f}"),
+            _fmt_optional(row.obs_freq, "{:.4f}"),
+            f"[{_fmt_optional(row.wilson_lo, '{:.3f}')}, "
+            f"{_fmt_optional(row.wilson_hi, '{:.3f}')}]",
+        )
+    console.print(table)
+    console.print(f"ECE [bold]{report.ece:.4f}[/bold] · MCE [bold]{report.mce:.4f}[/bold]")
+
+
+def _print_domains(scored: Any) -> None:
+    from cascade.eval.score import domains_of
+
+    table = Table(title="Brier by domain (spec §10.4)")
+    table.add_column("domain", style="cyan")
+    table.add_column("n", justify="right")
+    table.add_column("base rate", justify="right")
+    table.add_column("Brier", justify="right")
+    for item in domains_of(scored):
+        table.add_row(item.domain, str(item.n), f"{item.base_rate:.4f}", f"{item.brier:.6f}")
+    console.print(table)
+
+
+BASELINE_CHOICES = ("climatology", "direct", "self_consistency")
+
+
+@eval_app.command("baselines")
+def eval_baselines(
+    config: OverlayOpt = None,
+    baseline: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--baseline",
+            help=f"Which to produce: {', '.join(BASELINE_CHOICES)}. Repeatable; default all.",
+        ),
+    ] = None,
+    samples: Annotated[
+        int | None,
+        typer.Option("--samples", help="Self-consistency draws; default ensemble.replicates."),
+    ] = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Use at most N scenarios (smoke runs).")
+    ] = None,
+) -> None:
+    """Produce the three baselines that are not ablation cells (spec §10.2).
+
+    Climatology needs no model. The two single-model baselines each get the
+    *same* Chronofence evidence an agent gets -- same cutoff, same k -- because
+    a baseline given less evidence measures retrieval rather than architecture.
+
+    Writes forecasts under the baseline config ids, as `cascade_sim`: a
+    baseline is a forecast and must be produced without sight of a label, the
+    same as every other forecast in the study (ADR-0022).
+    """
+    from cascade.corpus.embed import Embedder
+    from cascade.ensemble.schema import Forecast
+    from cascade.ensemble.store import write_forecast
+    from cascade.eval.baselines import (
+        CLIMATOLOGY_CONFIG_ID,
+        DIRECT_CONFIG_ID,
+        SELF_CONSISTENCY_CONFIG_ID,
+        climatology_forecasts,
+        run_single_model,
+    )
+    from cascade.ledger.store import load_scenarios
+    from cascade.retrieval.search import Chronofence
+
+    settings = _settings(config)
+    split = _frozen_split(settings)
+    wanted = tuple(baseline) if baseline else BASELINE_CHOICES
+    unknown = sorted(set(wanted) - set(BASELINE_CHOICES))
+    if unknown:
+        _fail(
+            f"unknown baseline(s) {unknown}; choose from {list(BASELINE_CHOICES)}",
+            EXIT_PRECONDITION,
+        )
+    scenarios = sorted(load_scenarios(settings, role="admin"), key=lambda s: s.scenario_id)
+    if limit is not None:
+        scenarios = scenarios[:limit]
+    if not scenarios:
+        _fail("scenario registry is empty; run `cascade ledger build`", EXIT_PRECONDITION)
+
+    # 1. Climatology. No model, no evidence, no call -- and therefore the one
+    # baseline producible without a credential, which is why it is selectable
+    # on its own rather than bundled with the two that are not.
+    written = 0
+    if "climatology" not in wanted:
+        written = -1
+    if "climatology" in wanted:
+        for scenario_id, p_hat in climatology_forecasts(
+            [item.scenario_id for item in scenarios], base_rate=split.base_rate
+        ):
+            write_forecast(
+                settings,
+                Forecast(
+                    scenario_id=scenario_id,
+                    config_id=CLIMATOLOGY_CONFIG_ID,
+                    p_hat=p_hat,
+                    sigma=0.0,
+                    ci_lo=p_hat,
+                    ci_hi=p_hat,
+                    modality="single",
+                    n_replicates=1,
+                    # Arithmetic over the sealed base rate: no runs, no kernel,
+                    # no model. Claiming a decider here would be a claim that is
+                    # checkable and false.
+                    policy="none",
+                ),
+            )
+            written += 1
+        console.print(
+            f"climatology: [bold]{written}[/bold] forecasts at the sealed base rate "
+            f"{split.base_rate:.4f}"
+        )
+
+    plans: list[tuple[str, int, float]] = []
+    if "direct" in wanted:
+        plans.append((DIRECT_CONFIG_ID, 1, 0.0))
+    if "self_consistency" in wanted:
+        draws = samples if samples is not None else settings.ensemble.replicates
+        plans.append((SELF_CONSISTENCY_CONFIG_ID, draws, settings.models.temperature))
+    if not plans:
+        return
+
+    # 2 and 3. The single-model baselines, on the agents' own evidence.
+    _require_api_key(settings)
+    embedder = Embedder(
+        model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
+    )
+    embedder.load()
+    retrieved: dict[str, tuple[tuple[str, str, str], ...]] = {}
+    with Chronofence(settings, role="eval") as fence:
+        for scenario in scenarios:
+            vector = embedder.encode([f"{scenario.question} {scenario.resolution_criterion}"])[0]
+            found = fence.search(vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent)
+            retrieved[scenario.scenario_id] = tuple(
+                (chunk.published_at.isoformat(), chunk.source, chunk.body) for chunk in found.chunks
+            )
+
+    for baseline_config, draws, temperature in plans:
+        run = run_single_model(
+            settings,
+            scenarios,
+            retrieved,
+            config_id=baseline_config,
+            samples=draws,
+            temperature=temperature,
+        )
+        for collapsed in run.collapsed:
+            write_forecast(
+                settings,
+                Forecast(
+                    scenario_id=collapsed.scenario_id,
+                    config_id=baseline_config,
+                    p_hat=collapsed.p_hat,
+                    sigma=collapsed.sigma,
+                    ci_lo=max(0.0, collapsed.p_hat - 1.96 * collapsed.sigma),
+                    ci_hi=min(1.0, collapsed.p_hat + 1.96 * collapsed.sigma),
+                    modality="single",
+                    n_replicates=collapsed.n_parsed,
+                ),
+            )
+        console.print(
+            f"{baseline_config}: [bold]{run.scenarios_scored}[/bold] of "
+            f"{run.scenarios_requested} scenarios from {run.calls:,} calls; "
+            f"{run.unparseable} unparseable answer(s) dropped, never scored as 0.5"
+        )
+
+
+@eval_app.command("estimate")
+def eval_estimate(
+    config: OverlayOpt = None,
+    units: Annotated[
+        int, typer.Option("--units", help="Sample scenarios to measure before extrapolating.")
+    ] = 20,
+    samples: Annotated[
+        int | None,
+        typer.Option("--samples", help="Self-consistency draws; default ensemble.replicates."),
+    ] = None,
+) -> None:
+    """Project the baseline phase's spend from a measured sample (spec §12.4).
+
+    "Every phase supports --estimate, which runs 20 sample units, extrapolates,
+    and prints projected spend. No full phase launches without it." The
+    self-consistency baseline alone is 36,000 calls -- the single largest
+    block of the `baseline` ceiling -- so this is the guardrail that stops it
+    being discovered by the invoice.
+
+    Exits **2** on a projected breach, the same code a real breach uses, so a
+    supervising script does not have to tell a projection from an abort.
+    """
+    from cascade.corpus.embed import Embedder
+    from cascade.eval.baselines import (
+        DIRECT_CONFIG_ID,
+        SELF_CONSISTENCY_CONFIG_ID,
+        run_single_model,
+    )
+    from cascade.ledger.store import load_scenarios
+    from cascade.llm.client import LLMClient
+    from cascade.llm.meter import estimate_phase
+    from cascade.retrieval.search import Chronofence
+
+    settings = _settings(config)
+    _frozen_split(settings)
+    _require_api_key(settings)
+    draws = samples if samples is not None else settings.ensemble.replicates
+
+    scenarios = sorted(load_scenarios(settings, role="admin"), key=lambda item: item.scenario_id)
+    if not scenarios:
+        _fail("scenario registry is empty; run `cascade ledger build`", EXIT_PRECONDITION)
+    sample = scenarios[: max(1, units)]
+
+    embedder = Embedder(
+        model_name=settings.models.embedding, batch_size=settings.corpus.embed_batch_size
+    )
+    embedder.load()
+    retrieved: dict[str, tuple[tuple[str, str, str], ...]] = {}
+    with Chronofence(settings, role="eval") as fence:
+        for scenario in sample:
+            vector = embedder.encode([f"{scenario.question} {scenario.resolution_criterion}"])[0]
+            found = fence.search(vector, as_of=scenario.cutoff_ts, k=settings.retrieval.k_agent)
+            retrieved[scenario.scenario_id] = tuple(
+                (chunk.published_at.isoformat(), chunk.source, chunk.body) for chunk in found.chunks
+            )
+
+    client = LLMClient(settings, phase="baseline")
+    for config_id, count, temperature in (
+        (DIRECT_CONFIG_ID, 1, 0.0),
+        (SELF_CONSISTENCY_CONFIG_ID, draws, settings.models.temperature),
+    ):
+        run_single_model(
+            settings,
+            sample,
+            retrieved,
+            config_id=config_id,
+            samples=count,
+            temperature=temperature,
+            client=client,
+        )
+
+    estimate = estimate_phase(
+        phase="baseline",
+        sample_units=len(sample),
+        sample_usd=client.meter.total_usd,
+        total_units=len(scenarios),
+        ceiling_usd=settings.phase_ceiling("baseline"),
+    )
+    table = Table(title="Baseline phase estimate (spec §12.4)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Sampled", justify="right")
+    table.add_column("Projected", justify="right")
+    table.add_row("scenarios", f"{estimate.sample_units:,}", f"{estimate.total_units:,}")
+    table.add_row(
+        "model calls",
+        f"{estimate.sample_units * (1 + draws):,}",
+        f"{estimate.total_units * (1 + draws):,}",
+    )
+    table.add_row("spend (USD)", f"${estimate.sample_usd:.6f}", f"${estimate.projected_usd:.6f}")
+    table.add_row("ceiling (USD)", "-", f"${estimate.ceiling_usd:.2f}")
+    console.print(table)
+    console.print(f"cache hit rate over the sample: {client.cache.stats.hit_rate:.4f}")
+    if not estimate.within_ceiling:
+        _fail(
+            f"projected ${estimate.projected_usd:.2f} against a "
+            f"${estimate.ceiling_usd:.2f} ceiling for the baseline phase",
+            EXIT_BUDGET_BREACH,
+        )
+    console.print("[bold green]projection is within the baseline ceiling[/bold green]")
+
+
+@eval_app.command("grid")
+def eval_grid(
+    config: OverlayOpt = None,
+    policy: Annotated[str, typer.Option("--policy")] = "agent",
+    wave: Annotated[int, typer.Option("--wave")] = 200,
+    replicate_policy: Annotated[
+        str,
+        typer.Option(
+            "--replicate-policy",
+            help="'budget_capped' (D capped at ensemble.ablation_replicates) or 'design'.",
+        ),
+    ] = "budget_capped",
+    cells: Annotated[
+        list[str] | None, typer.Option("--cell", help="Restrict to these cell ids. Repeatable.")
+    ] = None,
+    limit: Annotated[int | None, typer.Option("--limit")] = None,
+) -> None:
+    """Execute Appendix C's 12-cell grid and collapse each cell (spec §10.3).
+
+    Resumable in exactly the way the fan-out is: a run row exists only for a
+    run that finished, so a re-run plans the difference. Cells are executed in
+    id order, and each is collapsed as soon as it completes, so an interrupted
+    grid leaves whole cells scoreable rather than a partial everything.
+
+    `--replicate-policy` resolves CLAUDE.md's open question Q1 explicitly. The
+    choice is printed here and written into the report; it is not inferred from
+    a run count.
+    """
+    from cascade.decompose.store import completed_scenarios
+    from cascade.ensemble.aggregate import collapse
+    from cascade.ensemble.runner import EnsembleRunner
+    from cascade.ensemble.store import collapse_inputs, write_forecast
+    from cascade.eval.ablation import CELLS, cell_by_id, grid_replicates, grid_scenarios
+
+    base = _settings(config)
+    split = _frozen_split(base)
+    if replicate_policy not in {"budget_capped", "design"}:
+        _fail(
+            f"unknown replicate policy {replicate_policy!r}; expected "
+            "'budget_capped' or 'design'",
+            EXIT_PRECONDITION,
+        )
+    selected = [cell_by_id(cell_id) for cell_id in cells] if cells else list(CELLS)
+
+    from cascade.ledger.store import load_scenarios
+
+    registry = sorted(item.scenario_id for item in load_scenarios(base, role="admin"))
+    compiled = sorted(completed_scenarios(base))
+    if not registry:
+        _fail("scenario registry is empty; run `cascade ledger build`", EXIT_PRECONDITION)
+
+    summary = Table(title=f"Ablation grid (spec Appendix C, policy={replicate_policy})")
+    summary.add_column("cell", style="cyan")
+    summary.add_column("A", justify="center")
+    summary.add_column("B", justify="center")
+    summary.add_column("C")
+    summary.add_column("D design", justify="right")
+    summary.add_column("D run", justify="right")
+    summary.add_column("scenarios", justify="right")
+    summary.add_column("runs", justify="right")
+
+    for cell in selected:
+        settings = _settings(cell.cell_id)
+        replicates, note = grid_replicates(
+            cell,
+            policy=replicate_policy,  # type: ignore[arg-type]
+            ablation_cap=base.ensemble.ablation_replicates,
+        )
+        pool = registry if not cell.decomposition else compiled
+        if not pool:
+            summary.add_row(
+                cell.cell_id,
+                "on" if cell.decomposition else "off",
+                "on" if cell.information_asymmetry else "off",
+                cell.grounding,
+                str(cell.replicates_design),
+                str(replicates),
+                "0",
+                "no compiled graph",
+            )
+            continue
+        scenario_ids = list(
+            grid_scenarios(
+                pool,
+                cell=cell,
+                salt=split.study_salt,
+                cap=base.ensemble.ablation_scenarios,
+            )
+        )
+        if limit is not None:
+            scenario_ids = scenario_ids[:limit]
+
+        loom_for, on_complete, _ = _fanout_wiring(
+            settings, policy=policy, scenario_ids=scenario_ids
+        )
+        runner = EnsembleRunner(
+            settings=settings,
+            loom_for=loom_for,
+            on_complete=on_complete,
+            policy=policy,
+            completed=_completed_for(settings),
+        )
+        tasks, skipped = runner.plan(
+            scenario_ids=scenario_ids, config_id=cell.cell_id, replicates=replicates
+        )
+        console.print(f"[bold]{cell.cell_id}[/bold] {cell.role} — {note}")
+        if tasks:
+            report = runner.execute(tasks, wave=wave)
+            _print_fanout(report, skipped=skipped, policy=policy)
+
+        for item in collapse_inputs(settings, config_id=cell.cell_id):
+            write_forecast(
+                settings,
+                collapse(
+                    item.scores,
+                    scenario_id=item.scenario_id,
+                    config_id=item.config_id,
+                    salt=settings.study.salt,
+                    sigma_threshold=settings.ensemble.sigma_multimodal_threshold,
+                    bootstrap_b=settings.ensemble.bootstrap_b,
+                    mean_events=item.mean_events,
+                    mean_steps=item.mean_steps,
+                    absorbed_runs=item.absorbed_runs,
+                    policy=item.policy,
+                ),
+            )
+        summary.add_row(
+            cell.cell_id,
+            "on" if cell.decomposition else "off",
+            "on" if cell.information_asymmetry else "off",
+            cell.grounding,
+            str(cell.replicates_design),
+            str(replicates),
+            str(len(scenario_ids)),
+            f"{len(tasks) + skipped:,}",
+        )
+    console.print(summary)
+
+
+def _completed_for(settings: Settings) -> Any:
+    """Bind one cell's settings into its resume lookup.
+
+    A closure written inline in the grid loop would capture `settings` by
+    reference, and `settings` is rebound on every iteration -- so each cell
+    would resume against whichever configuration the loop happened to end on.
+    A factory binds it once, at the iteration that owns it.
+    """
+    from cascade.trace.store import completed_replicates
+
+    def completed(scenario_id: str, config_id: str) -> set[int]:
+        return completed_replicates(settings, scenario_id=scenario_id, config_id=config_id)
+
+    return completed
+
+
+@eval_app.command("significance")
+def eval_significance(
+    config: OverlayOpt = None,
+    headline: Annotated[
+        str, typer.Option("--headline", help="Configuration every other cell is compared against.")
+    ] = "C01",
+) -> None:
+    """Paired bootstrap CIs with Holm-Bonferroni adjustment (spec §10.4).
+
+    Every comparison is paired on the scenarios both configurations scored, and
+    the paired count is printed: the 11 capped cells run 90 scenarios against
+    the headline's 180, so an unpaired comparison would silently compare two
+    different sets.
+    """
+    settings = _settings(config)
+    split = _frozen_split(settings)
+    comparisons = _build_comparisons(settings, split, headline=headline)
+    if not comparisons:
+        _fail(
+            "no comparison had forecasts on both sides; run `cascade eval grid` first",
+            EXIT_PRECONDITION,
+        )
+    table = Table(title="Ablation significance (spec §10.4)")
+    table.add_column("comparison", style="cyan", overflow="fold")
+    table.add_column("A - B", justify="right")
+    table.add_column("delta Brier", justify="right")
+    table.add_column("95% CI", justify="right")
+    table.add_column("n", justify="right")
+    table.add_column("p", justify="right")
+    table.add_column("Holm p*", justify="right")
+    for item in comparisons:
+        table.add_row(
+            item.name,
+            f"{item.config_a} - {item.config_b}",
+            f"{item.interval.point:+.6f}",
+            f"[{item.interval.lo:+.6f}, {item.interval.hi:+.6f}]",
+            str(item.n_paired),
+            f"{item.interval.p_value:.4g}",
+            "-" if item.p_adjusted is None else f"{item.p_adjusted:.4g}",
+        )
+    console.print(table)
+    console.print(
+        "[dim]Information asymmetry is nested inside causal decomposition, so the two "
+        "leave-one-out deltas do not sum. The net figure is reported above rather than "
+        "left for a reader to compute (§10.3).[/dim]"
+    )
+
+
+def _build_comparisons(settings: Settings, split: Any, *, headline: str = "C01") -> list[Any]:
+    """Pair every comparison in the family on the scenarios both sides scored.
+
+    Pairing is on the intersection, and the intersection size travels with the
+    result: the 11 capped cells run 90 scenarios against the headline's 180, so
+    a comparison that ignored the overlap would be comparing two different sets
+    and calling the difference an effect.
+    """
+    from cascade.eval.ablation import comparison_family
+    from cascade.eval.metrics import brier
+    from cascade.eval.schema import Comparison
+    from cascade.eval.stats import adjust_family, bootstrap_seed, paired_bootstrap
+    from cascade.eval.store import available_configs, scored_forecasts
+
+    cache: dict[str, dict[str, Any]] = {}
+
+    def load(config_id: str) -> dict[str, Any]:
+        if config_id not in cache:
+            cache[config_id] = {
+                item.scenario_id: item for item in scored_forecasts(settings, config_id=config_id)
+            }
+        return cache[config_id]
+
+    built: list[Any] = []
+    stored = [name for name, _ in available_configs(settings)]
+    for spec in comparison_family(available=stored, headline=headline):
+        left, right = load(spec.config_a), load(spec.config_b)
+        shared = sorted(set(left) & set(right))
+        if len(shared) < 2:
+            continue
+        pa = [left[key].p_hat for key in shared]
+        pb = [right[key].p_hat for key in shared]
+        outcomes = [left[key].outcome for key in shared]
+        interval = paired_bootstrap(
+            pa,
+            pb,
+            outcomes,
+            seed=bootstrap_seed(split.study_salt, spec.config_a, spec.config_b),
+            b_resamples=settings.ensemble.bootstrap_b,
+        )
+        built.append(
+            Comparison(
+                name=spec.name,
+                config_a=spec.config_a,
+                config_b=spec.config_b,
+                brier_a=brier(pa, outcomes),
+                brier_b=brier(pb, outcomes),
+                n_paired=len(shared),
+                interval=interval,
+            )
+        )
+    return list(adjust_family(built))
+
+
+@eval_app.command("status")
+def eval_status(config: OverlayOpt = None) -> None:
+    """What is scoreable right now, and what the grid is still missing."""
+    from cascade.eval.ablation import CELLS
+    from cascade.eval.baselines import BASELINES
+    from cascade.eval.store import available_configs, config_policies
+
+    settings = _settings(config)
+    split = _frozen_split(settings)
+    stored = dict(available_configs(settings))
+    policies = config_policies(settings)
+
+    console.print(
+        f"frozen split [bold]{split.manifest_sha256[:16]}...[/bold] "
+        f"({split.n_scenarios} scenarios, base rate {split.base_rate:.4f}, "
+        f"climatology Brier {split.climatology_brier:.6f})"
+    )
+
+    cells = Table(title="Ablation grid (spec Appendix C)")
+    cells.add_column("cell", style="cyan")
+    cells.add_column("A", justify="center")
+    cells.add_column("B", justify="center")
+    cells.add_column("C")
+    cells.add_column("D", justify="right")
+    cells.add_column("forecasts", justify="right")
+    cells.add_column("decider")
+    cells.add_column("role", overflow="fold")
+    for cell in CELLS:
+        seen = policies.get(cell.cell_id, ())
+        cells.add_row(
+            cell.cell_id,
+            "on" if cell.decomposition else "off",
+            "on" if cell.information_asymmetry else "off",
+            cell.grounding,
+            str(cell.replicates_design),
+            f"{stored.get(cell.cell_id, 0):,}",
+            (
+                ("[yellow]" + ", ".join(seen) + "[/yellow]")
+                if set(seen) - {"agent"}
+                else (", ".join(seen) or "-")
+            ),
+            cell.role,
+        )
+    console.print(cells)
+
+    baselines = Table(title="Baselines (spec §10.2)")
+    baselines.add_column("baseline", style="cyan")
+    baselines.add_column("config", justify="right")
+    baselines.add_column("forecasts", justify="right")
+    baselines.add_column("purpose", overflow="fold")
+    for spec in BASELINES:
+        baselines.add_row(
+            spec.name, spec.config_id, f"{stored.get(spec.config_id, 0):,}", spec.purpose
+        )
+    console.print(baselines)
+
+    provisional = [
+        config_id
+        for config_id, seen in sorted(policies.items())
+        if {"heuristic", "mixed"} & set(seen)
+    ]
+    if provisional:
+        console.print(
+            f"[yellow]{len(provisional)} config(s) hold forecasts from a stand-in "
+            f"decider: {', '.join(provisional)}.[/yellow] Resuming a grid into them "
+            "produces a 'mixed' forecast, which the report flags. Remove the "
+            "heuristic-policy rows from `runs` and re-collapse before a study run."
+        )
+
+
+@eval_app.command("prompt-audit")
+def eval_prompt_audit(
+    config: OverlayOpt = None,
+    prompt_rev: Annotated[str, typer.Option("--rev", help="Revision to record against.")] = "",
+    subsystem: Annotated[str, typer.Option("--subsystem")] = "compiler",
+    before: Annotated[float | None, typer.Option("--before")] = None,
+    after: Annotated[float | None, typer.Option("--after")] = None,
+) -> None:
+    """Record §1.3's before/after Brier for a prompt revision.
+
+    "Any edit to an agent, decomposition or arbiter prompt after the first full
+    backtest is recorded with the Brier before and after, so tuning-on-test is
+    visible in the record rather than hidden." With no `--after`, the headline
+    configuration's measured Brier is used -- the number the revision has to be
+    judged against, taken from the measurement rather than typed in.
+    """
+    from cascade.eval.store import record_prompt_revision_brier
+
+    settings = _settings(config)
+    split = _frozen_split(settings)
+    rev = prompt_rev or settings.llm.prompt_rev
+    measured = after
+    if measured is None:
+        metrics, _ = _metrics_for_config(settings, "C01", split)
+        measured = None if metrics is None else metrics.brier
+    updated = record_prompt_revision_brier(
+        settings,
+        prompt_rev=rev,
+        subsystem=subsystem,
+        brier_before=before,
+        brier_after=measured,
+    )
+    if not updated:
+        _fail(
+            f"no prompt_revisions row for ({rev!r}, {subsystem!r}); a revision is "
+            "recorded by the migration that makes it, not by this command",
+            EXIT_PRECONDITION,
+        )
+    console.print(
+        f"recorded prompt revision {rev!r}/{subsystem}: before="
+        f"{'null' if before is None else f'{before:.6f}'}, after="
+        f"{'null' if measured is None else f'{measured:.6f}'}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# report: the Appendix D artifact (M7)
+# ---------------------------------------------------------------------------
+
+
+@app.command("report")
+def report(
+    config: OverlayOpt = None,
+    headline: Annotated[
+        str, typer.Option("--headline", help="Cell whose metrics lead the report.")
+    ] = "C01",
+    replicate_policy: Annotated[str, typer.Option("--replicate-policy")] = "budget_capped",
+    out: Annotated[
+        str | None, typer.Option("--out", help="Report root; default paths.reports.")
+    ] = None,
+) -> None:
+    """Write `reports/study_{ts}/` from whatever has been measured (Appendix D).
+
+    Writes what exists and names what does not. A quantity that could not be
+    produced appears as null in the JSON and in a "Not produced" section in
+    `headline.md`; nothing is filled in with the value the spec expects, which
+    is the §1 rule stated as a code path rather than as an intention.
+
+    Exits 0 even when the study is incomplete. A report of a blocked milestone
+    is a real artifact -- it is the record of what was and was not measurable --
+    and making it exit non-zero would mean the only way to produce one is to
+    have finished.
+    """
+    from datetime import UTC, datetime
+
+    from cascade.ensemble.aggregate import convergence_curve
+    from cascade.ensemble.store import scores_by_scenario
+    from cascade.eval.ablation import (
+        CELLS,
+        comparison_family,
+        grid_replicates,
+        missing_cells,
+    )
+    from cascade.eval.baselines import BASELINES
+    from cascade.eval.report import StudyArtifact, git_sha, report_id, write_report
+    from cascade.eval.schema import AblationCell
+    from cascade.eval.score import calibration_of, dispersion_finding, domains_of
+    from cascade.eval.stats import bootstrap_seed
+    from cascade.eval.store import available_configs, write_study_report
+
+    settings = _settings(config)
+    split = _frozen_split(settings)
+    stored = dict(available_configs(settings))
+    now = datetime.now(UTC)
+    identifier = report_id(now=now)
+    blocked: list[str] = []
+
+    # -- per-config metrics -------------------------------------------------
+    metrics: list[MetricSet] = []
+    scored_by_config: dict[str, tuple[ScoredForecast, ...]] = {}
+    for config_id in sorted(stored):
+        measured, scored = _metrics_for_config(settings, config_id, split)
+        if measured is not None:
+            metrics.append(measured)
+            scored_by_config[config_id] = scored
+
+    head_metrics = next((entry for entry in metrics if entry.config_id == headline), None)
+    head_scored = scored_by_config.get(headline, ())
+    if head_metrics is None:
+        blocked.append(
+            f"Headline Brier, skill scores, calibration and per-domain table: the "
+            f"headline configuration {headline!r} has no stored forecasts. Run "
+            "`cascade compile build`, `cascade simulate all` and "
+            "`cascade ensemble collapse`."
+        )
+
+    # -- the twelve cells ---------------------------------------------------
+    cells: list[AblationCell] = []
+    notes: list[str] = []
+    for cell in CELLS:
+        _planned, note = grid_replicates(
+            cell,
+            policy=replicate_policy,  # type: ignore[arg-type]
+            ablation_cap=settings.ensemble.ablation_replicates,
+        )
+        notes.append(note)
+        cell_metrics = next((entry for entry in metrics if entry.config_id == cell.cell_id), None)
+        # Measured, not planned. The planned count is what `grid_replicates`
+        # returns and it is already stated in the note above; putting it in
+        # `replicates_executed` would answer "how many did it run" with "how
+        # many were we going to run", which is precisely the conflation Q1 is
+        # about.
+        cell_scored = scored_by_config.get(cell.cell_id, ())
+        executed_replicates = (
+            max(item.n_replicates for item in cell_scored) if cell_scored else None
+        )
+        cells.append(
+            AblationCell(
+                cell_id=cell.cell_id,
+                config_id=cell.cell_id,
+                decomposition=cell.decomposition,
+                information_asymmetry=cell.information_asymmetry,
+                grounding=cell.grounding,
+                replicates_design=cell.replicates_design,
+                replicates_executed=executed_replicates,
+                scenarios_executed=stored.get(cell.cell_id, 0),
+                role=cell.role,
+                metrics=cell_metrics,
+            )
+        )
+    absent = missing_cells(sorted(stored))
+    if absent:
+        blocked.append(
+            f"{len(absent)} of {len(CELLS)} ablation cells have no forecasts "
+            f"({', '.join(absent)}). Run `cascade eval grid`."
+        )
+
+    # -- baselines ----------------------------------------------------------
+    baselines: list[tuple[str, str, str, Any]] = []
+    for spec in BASELINES:
+        measured = next((entry for entry in metrics if entry.config_id == spec.config_id), None)
+        baselines.append((spec.baseline_id, spec.name, spec.config_id, measured))
+        if measured is None:
+            blocked.append(f"Baseline {spec.name!r} ({spec.config_id}): no stored forecasts.")
+
+    # -- significance -------------------------------------------------------
+    comparisons = _build_comparisons(settings, split, headline=headline)
+    readings = {
+        spec.name: spec.reading
+        for spec in comparison_family(available=sorted(stored), headline=headline)
+    }
+    if not comparisons:
+        blocked.append(
+            "Paired bootstrap intervals and Holm-adjusted p-values: no comparison "
+            "had forecasts on both sides."
+        )
+
+    # -- dispersion and convergence -----------------------------------------
+    dispersion = None
+    if head_scored:
+        dispersion = dispersion_finding(
+            head_scored,
+            sigma_threshold=settings.ensemble.sigma_multimodal_threshold,
+            seed=bootstrap_seed(split.study_salt, "dispersion", headline),
+        )
+    convergence: tuple[tuple[int, float, float, int], ...] = ()
+    try:
+        curve = convergence_curve(scores_by_scenario(settings, config_id=headline))
+        convergence = tuple(
+            (point.n, point.mean_abs_change, point.mean_sigma, point.scenarios) for point in curve
+        )
+    except Exception as exc:  # noqa: BLE001 -- a missing curve is reported, never fatal
+        blocked.append(f"Convergence curve (§9.3): {type(exc).__name__}: {exc}")
+    if not convergence and not any(message.startswith("Convergence") for message in blocked):
+        blocked.append(
+            "Convergence curve (§9.3): no scenario has enough replicates to reach "
+            "the first rung."
+        )
+
+    # -- per-scenario CSV rows ----------------------------------------------
+    baseline_ids = {spec.config_id for spec in BASELINES}
+    baseline_rows = tuple(
+        (item.config_id, item.scenario_id, item.p_hat, item.outcome)
+        for config_id in sorted(baseline_ids & set(scored_by_config))
+        for item in scored_by_config[config_id]
+    )
+    grid_ids = {cell.cell_id for cell in CELLS}
+    grid_rows = tuple(
+        (item.config_id, item.scenario_id, item.p_hat, item.sigma, item.outcome)
+        for config_id in sorted(grid_ids & set(scored_by_config))
+        for item in scored_by_config[config_id]
+    )
+
+    artifact = StudyArtifact(
+        report_id=identifier,
+        written_at=now,
+        manifest_sha256=split.manifest_sha256,
+        git_sha=git_sha(),
+        n_scenarios_sealed=split.n_scenarios,
+        base_rate=split.base_rate,
+        climatology_brier=split.climatology_brier,
+        study_salt=split.study_salt,
+        models={
+            "agent": settings.models.agent,
+            "compiler": settings.models.compiler,
+            "embedding": settings.models.embedding,
+        },
+        config_snapshot=_report_config_snapshot(settings),
+        headline_config=headline,
+        replicate_policy=_replicate_policy_sentence(replicate_policy, settings),
+        replicate_notes=tuple(notes),
+        metrics=tuple(metrics),
+        baselines=tuple(baselines),
+        cells=tuple(cells),
+        comparisons=tuple(comparisons),
+        comparison_readings=readings,
+        calibration=calibration_of(head_scored) if head_scored else None,
+        per_domain=domains_of(head_scored) if head_scored else (),
+        dispersion=dispersion,
+        convergence=convergence,
+        scored=tuple(head_scored),
+        baseline_rows=baseline_rows,
+        grid_rows=grid_rows,
+        leakage=_leakage_snapshot(settings),
+        cost_ledger=_cost_snapshot(settings),
+        blocked=tuple(blocked),
+    )
+
+    root = Path(out) if out else repo_root() / settings.paths.reports
+    directory = write_report(artifact, root=root)
+    write_study_report(
+        settings,
+        report_id=identifier,
+        manifest_sha256=split.manifest_sha256,
+        git_sha=artifact.git_sha,
+        headline_config=headline,
+        n_scenarios=split.n_scenarios,
+        headline_brier=None if head_metrics is None else head_metrics.brier,
+        notes=(
+            f"{len(CELLS) - len(absent)}/{len(CELLS)} cells scored; "
+            f"{len(blocked)} quantities not produced"
+        ),
+    )
+
+    console.print(f"report written to [bold]{directory}[/bold]")
+    if head_metrics is not None:
+        _print_metrics(head_metrics, title=f"Headline -- {headline}")
+    if blocked:
+        console.print(f"[yellow]{len(blocked)} quantity/quantities not produced:[/yellow]")
+        for message in blocked:
+            console.print(f"  - {message}")
+
+
+def _replicate_policy_sentence(policy: str, settings: Settings) -> str:
+    """State which reading of Q1 the report applies, in the report's own words."""
+    if policy == "design":
+        return (
+            "Every cell ran at its Appendix C design factor D. No budget cap was "
+            "applied, so the ensemble-contribution estimate is an estimate at the "
+            "designed replicate count."
+        )
+    return (
+        "Appendix C's D is read as the design factor and "
+        f"§10.3/§12.3's {settings.ensemble.ablation_replicates} replicates as a budget "
+        "cap on the 11 non-headline cells; the headline cell runs at the full D. "
+        "This resolves the Q1 ambiguity in CLAUDE.md. The ensemble contribution "
+        "estimated from a capped cell is an estimate at the capped count, not at D."
+    )
+
+
+def _report_config_snapshot(settings: Settings) -> dict[str, Any]:
+    """The configuration that produced the report, as primitive data.
+
+    Appendix D asks manifest.json to carry "config". Secrets are Pydantic
+    SecretStr and are not in these sections, so this projection cannot leak one.
+    """
+    return {
+        "study": settings.study.model_dump(mode="json"),
+        "kernel": settings.kernel.model_dump(mode="json"),
+        "aperture": settings.aperture.model_dump(mode="json"),
+        "retrieval": settings.retrieval.model_dump(mode="json"),
+        "ensemble": settings.ensemble.model_dump(mode="json"),
+        "flags": settings.flags.model_dump(mode="json"),
+        "llm": {"mode": settings.llm.mode, "prompt_rev": settings.llm.prompt_rev},
+        "pinned_stack": {entry.label: entry.pin for entry in PINNED_STACK},
+    }
+
+
+def _leakage_snapshot(settings: Settings) -> dict[str, Any]:
+    """Appendix D's leakage_report.json, from what is actually verifiable here.
+
+    Poison-pill hits and memorisation scores are produced by `cascade retrieval`
+    commands and are not recomputed here -- recomputing them would be a second
+    implementation of the study's leakage claim. What this records is the state
+    of the three structural mechanisms §1.3 names, which *is* checkable at
+    report time.
+    """
+    from cascade.eval.store import prompt_revision_audit
+
+    snapshot: dict[str, Any] = {
+        "frozen_split_asserted": True,
+        "label_grant": "cascade_sim has no grant on scenario_labels (migration 002)",
+        "aggregation_role": "cascade_sim (ADR-0022)",
+        "poison_pill_hits": None,
+        "poison_pill_note": (
+            "Measured by `make test-leakage`, not recomputed here; a second "
+            "implementation of a leakage check is a second thing to get wrong."
+        ),
+        "memorization": None,
+        "memorization_note": (
+            "Measured by `cascade retrieval memorization`; needs " "CASCADE_ANTHROPIC_API_KEY."
+        ),
+    }
+    try:
+        snapshot["prompt_revisions"] = prompt_revision_audit(settings)
+    except Exception as exc:  # noqa: BLE001 -- reported in the artifact, never fatal
+        snapshot["prompt_revisions_error"] = f"{type(exc).__name__}: {exc}"
+    return snapshot
+
+
+def _cost_snapshot(settings: Settings) -> dict[str, Any]:
+    """Appendix D's cost_ledger.json: measured spend per phase where recorded.
+
+    Reads the meter checkpoints rather than re-pricing anything. §12.4's live
+    ledger reconciles against Langfuse at the end of each phase; that
+    reconciliation is M8's acceptance criterion and is not asserted here.
+    """
+    ledger: dict[str, Any] = {
+        "phase_ceilings_usd": {
+            phase: str(amount)
+            for phase, amount in sorted(settings.budget.phase_ceiling_usd.items())
+        },
+        "phases": {},
+        "note": (
+            "Spend is read from the per-phase meter checkpoints. Reconciliation "
+            "against the Langfuse total within 2% is M8's criterion (§12.4)."
+        ),
+    }
+    checkpoints = repo_root() / settings.paths.checkpoints
+    if checkpoints.is_dir():
+        for path in sorted(checkpoints.glob("*.checkpoint.json")):
+            try:
+                ledger["phases"][path.stem.split(".")[0]] = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                ledger["phases"][path.stem.split(".")[0]] = {
+                    "error": f"{type(exc).__name__}: {exc}"
+                }
+    return ledger
 
 
 # ---------------------------------------------------------------------------

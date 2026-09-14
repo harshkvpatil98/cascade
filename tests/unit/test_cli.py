@@ -36,9 +36,23 @@ CONSOLE_SCRIPT = Path(sys.executable).parent / "cascade"
 
 # Phases still to land. Each must refuse loudly rather than exit 0.
 # `ledger` left the stub list at M1, `corpus` at M2, `retrieval` arrived at M3,
-# `compile` at M4 and `simulate` at M5; all five are now sub-apps.
-DEFERRED_PHASES = ["evaluate", "trace", "report"]
-IMPLEMENTED_SUBAPPS = ["ledger", "corpus", "db", "retrieval", "compile", "simulate"]
+# `compile` at M4, `simulate` at M5, `ensemble` at M6 and `eval` + `report` at
+# M7; all of those are now sub-apps or real commands.
+DEFERRED_PHASES = ["trace"]
+# `evaluate` is not a stub and not a phase: it is a deprecated alias that
+# points at `cascade eval`. It exits non-zero like a stub, so it is listed
+# separately rather than folded into either list.
+DEPRECATED_ALIASES = ["evaluate"]
+IMPLEMENTED_SUBAPPS = [
+    "ledger",
+    "corpus",
+    "db",
+    "retrieval",
+    "compile",
+    "simulate",
+    "ensemble",
+    "eval",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +118,25 @@ def test_unimplemented_phase_exits_precondition(phase: str) -> None:
 def test_every_spec_subcommand_exists() -> None:
     """Spec §13: if it is a step in the study, it is reachable from the CLI."""
     result = runner.invoke(app, ["--help"])
-    for phase in ["doctor", *DEFERRED_PHASES, *IMPLEMENTED_SUBAPPS]:
+    for phase in ["doctor", "report", *DEFERRED_PHASES, *DEPRECATED_ALIASES, *IMPLEMENTED_SUBAPPS]:
         assert phase in result.output
+
+
+@pytest.mark.parametrize("alias", DEPRECATED_ALIASES)
+def test_a_deprecated_alias_names_its_replacement(alias: str) -> None:
+    """Removing it would fail with click's "no such command", which does not
+    say where the thing went -- and §13's command list still names it."""
+    result = runner.invoke(app, [alias])
+    assert result.exit_code == EXIT_PRECONDITION
+    assert "cascade eval" in result.output
+
+
+def test_eval_exposes_the_m7_lifecycle() -> None:
+    """status / score / baselines / grid / significance are what an M7
+    operator needs, and `cascade report` is what they produce."""
+    result = runner.invoke(app, ["eval", "--help"])
+    for command in ("status", "score", "baselines", "grid", "significance"):
+        assert command in result.output
 
 
 def test_compile_exposes_the_m4_lifecycle() -> None:

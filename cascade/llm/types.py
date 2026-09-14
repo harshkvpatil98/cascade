@@ -166,6 +166,13 @@ class LLMRequest(_Frozen):
     temperature: float
     max_tokens: int
     prompt_rev: str
+    # Which draw this is, when a caller deliberately wants several independent
+    # samples of one prompt -- §10.2's self-consistency baseline takes 200.
+    # It is never sent to the provider; it exists because the cache is
+    # content-addressed and would otherwise collapse 200 draws into one
+    # recording replayed 200 times, turning a dispersion measurement into a
+    # constant. Zero is the ordinary single-sample case.
+    sample_index: int = Field(default=0, ge=0)
 
     def cache_domain(self) -> dict[str, Any]:
         """Return exactly the fields the spec §8.3 key is computed over.
@@ -175,7 +182,7 @@ class LLMRequest(_Frozen):
         can legitimately produce different completions, and sharing a key
         between them would serve a truncated response as if it were whole.
         """
-        return {
+        domain: dict[str, Any] = {
             "model": self.model,
             "system": _strip_cache_control(self.system),
             "messages": _strip_cache_control(self.messages),
@@ -185,6 +192,12 @@ class LLMRequest(_Frozen):
             "max_tokens": self.max_tokens,
             "prompt_rev": self.prompt_rev,
         }
+        if self.sample_index:
+            # Added only when non-zero, so every recording made before this
+            # field existed keeps its key. A single-sample call is the same
+            # call it always was.
+            domain["sample_index"] = self.sample_index
+        return domain
 
 
 class LLMResult(_Frozen):

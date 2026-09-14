@@ -12,8 +12,10 @@ corpus total, and the count is an acceptance criterion.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from cascade.config import Settings
@@ -22,9 +24,11 @@ from cascade.corpus.simhash import from_signed, to_signed
 
 __all__ = [
     "CorpusStats",
+    "ScenarioCoverage",
     "completed_units",
     "corpus_stats",
     "mark_unit",
+    "scenario_coverage",
     "seen_simhashes",
     "write_batch",
 ]
@@ -215,3 +219,72 @@ def corpus_stats(settings: Settings) -> CorpusStats:
         earliest=row[0],
         latest=row[1],
     )
+
+
+@dataclass(frozen=True)
+class ScenarioCoverage:
+    """Admissible evidence for one scenario, measured at its own cutoff."""
+
+    scenario_id: str
+    cutoff_ts: Any
+    chunks_in_window: int
+    chunks_before_cutoff: int
+    latest_admissible: Any
+    staleness_days: int | None
+
+    def under_covered(self, minimum: int) -> bool:
+        return self.chunks_in_window < minimum
+
+
+def scenario_coverage(settings: Settings, *, lookback_months: int) -> tuple[ScenarioCoverage, ...]:
+    """Per-scenario evidence availability, measured at each scenario's cutoff.
+
+    Answers the question the chunk count cannot: not "is the corpus big" but
+    "does this scenario have anything recent to read". ``chunks_in_window``
+    counts chunks published in the ``lookback_months`` before the cutoff;
+    ``staleness_days`` is the gap between the cutoff and the most recent
+    admissible chunk, which is the number that exposes a corpus concentrated
+    in the wrong years.
+
+    Reads ``scenarios`` and ``chunks``. No outcome is touched (invariant 2),
+    and the cutoff comes from the registry rather than an argument, so this
+    cannot be asked about a time a scenario was not sealed at.
+
+    **Measured at day resolution, from one pass over the corpus.** A
+    correlated count per scenario is 180 aggregates over a 1.8M-row
+    partitioned table; a single day histogram is ~4,000 rows and the rest is
+    arithmetic. Days are compared strictly before the cutoff's own day, so a
+    chunk published earlier on the cutoff date is excluded -- the error is
+    always in the direction of reporting *less* coverage than exists, which is
+    the safe direction for a warning.
+    """
+    with _connect(settings) as conn, conn.cursor() as cur:
+        cur.execute("SELECT published_at::date AS day, count(*) FROM chunks GROUP BY 1 ORDER BY 1")
+        histogram = [(row[0], int(row[1])) for row in cur.fetchall()]
+        cur.execute("SELECT scenario_id, cutoff_ts FROM scenarios ORDER BY scenario_id")
+        scenarios = cur.fetchall()
+
+    days = [day for day, _ in histogram]
+    counts = [count for _, count in histogram]
+    prefix = [0]
+    for count in counts:
+        prefix.append(prefix[-1] + count)
+
+    coverage: list[ScenarioCoverage] = []
+    for scenario_id, cutoff_ts in scenarios:
+        cutoff_day = cutoff_ts.date()
+        window_start = (cutoff_ts - timedelta(days=int(lookback_months * 30.436875))).date()
+        end = bisect_left(days, cutoff_day)
+        start = bisect_left(days, window_start)
+        latest = days[end - 1] if end > 0 else None
+        coverage.append(
+            ScenarioCoverage(
+                scenario_id=str(scenario_id),
+                cutoff_ts=cutoff_ts,
+                chunks_in_window=prefix[end] - prefix[start],
+                chunks_before_cutoff=prefix[end],
+                latest_admissible=latest,
+                staleness_days=(cutoff_day - latest).days if latest is not None else None,
+            )
+        )
+    return tuple(coverage)

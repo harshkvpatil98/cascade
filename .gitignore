@@ -6,6 +6,8 @@
 .checkpoints/
 graphs/
 reports/study_*/
+# Run logs from long ingests and benches. Machine-local and large.
+.logs/
 
 # Python
 __pycache__/

@@ -181,6 +181,7 @@ class RetrievalConfig(_Model):
 class EnsembleConfig(_Model):
     replicates: int
     ablation_replicates: int
+    ablation_scenarios: int
     bootstrap_b: int
     sigma_multimodal_threshold: float
 
@@ -194,6 +195,12 @@ class FlagsConfig(_Model):
     causal_decomposition: bool
     information_asymmetry: bool
     grounding: Grounding
+    # Panel size for the `causal_decomposition: false` arm (Appendix C factor
+    # A off, "generic persona panel"). Configuration rather than a constant so
+    # it can be set to the decomposition arm's measured mean actor count --
+    # otherwise the two arms differ in panel size as well as in structure and
+    # the reported delta contains both.
+    panel_actors: int
 
 
 class LLMConfig(_Model):
@@ -264,6 +271,8 @@ class CorpusConfig(_Model):
     fetch_workers: int
     ccnews_max_files: int
     ccnews_max_records_per_file: int
+    coverage_lookback_months: int
+    coverage_min_chunks: int
     wikipedia_max_articles_per_scenario: int
 
 

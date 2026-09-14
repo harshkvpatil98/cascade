@@ -208,6 +208,12 @@ class ActorBrief(BaseModel):
     question_context: str
     evidence: tuple[tuple[str, str, str], ...]
     """(published_iso, source, excerpt) -- pre-cutoff, retrieved once per run."""
+    grounded: bool = True
+    """False under Appendix C's `grounding: parametric_only`. Distinguishes
+    "retrieval ran and found nothing admissible" from "retrieval was switched
+    off for this cell" -- the same empty evidence block, two different facts,
+    and an agent told the wrong one reasons differently about its own
+    ignorance."""
 
 
 def persona_block(brief: ActorBrief, *, evidence_chars: int) -> str:
@@ -220,13 +226,19 @@ def persona_block(brief: ActorBrief, *, evidence_chars: int) -> str:
     utility = ", ".join(f"{factor} {weight:+.2f}" for factor, weight in brief.utility)
     levers = ", ".join(f"{factor} (leverage {weight:.2f})" for factor, weight in brief.levers)
     constraints = "\n".join(f"- {item}" for item in brief.constraints) or "- none stated"
-    evidence = (
-        "\n\n".join(
+    if brief.evidence:
+        evidence = "\n\n".join(
             f"[{published}] {source}\n{excerpt[:evidence_chars]}"
             for published, source, excerpt in brief.evidence
         )
-        or "(no admissible evidence was found before the cutoff)"
-    )
+    elif brief.grounded:
+        evidence = "(no admissible evidence was found before the cutoff)"
+    else:
+        evidence = (
+            "(evidence retrieval is disabled in this configuration; reason from "
+            "what you already know, and treat the absence of documents as a "
+            "property of this exercise rather than as a fact about the world)"
+        )
     counterparties = ", ".join(brief.counterparties) or "(none reachable)"
     return f"""\
 # You
@@ -314,6 +326,7 @@ def brief_from(
     horizon: int,
     question_context: str,
     evidence: Sequence[tuple[str, str, str]],
+    grounded: bool = True,
 ) -> ActorBrief:
     """Assemble one actor's brief from the compiled graph and its evidence."""
     return ActorBrief(
@@ -331,4 +344,5 @@ def brief_from(
         horizon=horizon,
         question_context=question_context,
         evidence=tuple(evidence),
+        grounded=grounded,
     )

@@ -48,6 +48,7 @@ class CollapseInput:
     mean_events: float
     mean_steps: float
     absorbed_runs: int
+    policy: Literal["agent", "heuristic", "mixed", "none"]
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,9 @@ def collapse_inputs(
                    array_agg(outcome_score ORDER BY replicate) AS scores,
                    avg(decisions)  AS mean_events,
                    avg(steps_run)  AS mean_steps,
-                   count(*) FILTER (WHERE termination = 'absorbed') AS absorbed
+                   count(*) FILTER (WHERE termination = 'absorbed') AS absorbed,
+                   min(policy) AS min_policy,
+                   max(policy) AS max_policy
             FROM runs
             WHERE config_id = %s
             GROUP BY scenario_id
@@ -96,9 +99,21 @@ def collapse_inputs(
             mean_events=float(row[2]),
             mean_steps=float(row[3]),
             absorbed_runs=int(row[4]),
+            # A (scenario, config) whose runs disagree about the decider is
+            # half a mechanism check and half a study result. Reported as
+            # `mixed` rather than resolved to whichever came first.
+            policy=_policy_of(str(row[5]), str(row[6])),
         )
         for row in rows
     )
+
+
+def _policy_of(lowest: str, highest: str) -> Literal["agent", "heuristic", "mixed", "none"]:
+    if lowest != highest:
+        return "mixed"
+    if lowest in ("heuristic", "none"):
+        return lowest  # type: ignore[return-value]
+    return "agent"
 
 
 def scores_by_scenario(
@@ -124,8 +139,9 @@ def write_forecast(settings: Settings, forecast: Forecast, *, role: Role = "sim"
             """
             INSERT INTO forecasts (
                 scenario_id, config_id, p_hat, sigma, ci_lo, ci_hi, modality,
-                dip_p, bimodality, n_replicates, mean_events, mean_steps, absorbed_runs
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                dip_p, bimodality, n_replicates, mean_events, mean_steps, absorbed_runs,
+                policy
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (scenario_id, config_id) DO UPDATE SET
                 p_hat = EXCLUDED.p_hat,
                 sigma = EXCLUDED.sigma,
@@ -138,6 +154,7 @@ def write_forecast(settings: Settings, forecast: Forecast, *, role: Role = "sim"
                 mean_events = EXCLUDED.mean_events,
                 mean_steps = EXCLUDED.mean_steps,
                 absorbed_runs = EXCLUDED.absorbed_runs,
+                policy = EXCLUDED.policy,
                 collapsed_at = now()
             """,
             (
@@ -154,6 +171,7 @@ def write_forecast(settings: Settings, forecast: Forecast, *, role: Role = "sim"
                 forecast.mean_events,
                 forecast.mean_steps,
                 forecast.absorbed_runs,
+                forecast.policy,
             ),
         )
         conn.commit()
@@ -168,7 +186,8 @@ def load_forecasts(
         cur.execute(
             f"""
             SELECT scenario_id, config_id, p_hat, sigma, ci_lo, ci_hi, modality,
-                   dip_p, bimodality, n_replicates, mean_events, mean_steps, absorbed_runs
+                   dip_p, bimodality, n_replicates, mean_events, mean_steps,
+                   absorbed_runs, policy
             FROM forecasts {clause} ORDER BY scenario_id, config_id
             """,  # noqa: S608 -- `clause` is a literal chosen above, not input
             params,
@@ -189,6 +208,7 @@ def load_forecasts(
             mean_events=float(row[10]),
             mean_steps=float(row[11]),
             absorbed_runs=int(row[12]),
+            policy=_policy_of(str(row[13]), str(row[13])),
         )
         for row in rows
     )

@@ -44,7 +44,7 @@ Three mechanisms enforce integrity, and they are functional requirements:
 
 ---
 
-## 2. The eight hard invariants
+## 2. The nine hard invariants
 
 Each is enforced by a test, not by intention. `tests/unit/test_invariants.py`
 enforces 1, 5 and 7 statically.
@@ -67,6 +67,10 @@ enforces 1, 5 and 7 statically.
 7. **All iteration over collections is sorted.** Dict/set iteration order is a
    nondeterminism vector.
 8. **Every phase is resumable.** Checkpoint and skip completed units on restart.
+9. **No target value is ever written into a report code path** (§14.3). Enforced
+   statically by `tests/unit/test_eval_report.py`, which parses every module on
+   the report path and fails on a float literal equal to any figure in §1's
+   measurement contract.
 
 ---
 
@@ -151,6 +155,17 @@ cascade simulate estimate --units 20   # §12.4 dry run; exits 2 on a projected 
 cascade ensemble collapse  # PHASE 3: replicates -> forecasts (label-blind)
 cascade ensemble status    # measured dispersion over the stored forecasts
 cascade ensemble convergence   # §9.3's replicate-count curve
+
+cascade corpus coverage    # evidence at each scenario's own cutoff; exits 3 when short
+
+cascade eval status        # what is scoreable, and what the grid still lacks
+cascade eval baselines --baseline climatology   # §10.2's five, selectable
+cascade eval estimate      # §12.4 dry run for the baseline phase; exits 2 on a breach
+cascade eval grid          # PHASE 4: Appendix C's 12 cells, then collapse each
+cascade eval score --config-id C01   # §10.1 metrics for one configuration
+cascade eval significance  # paired bootstrap + Holm-Bonferroni (§10.4)
+cascade eval prompt-audit  # §1.3's before/after Brier for a prompt revision
+cascade report             # write reports/study_{ts}/ (Appendix D)
 ```
 
 ---
@@ -184,20 +199,35 @@ rest record choices the spec left open.
 | 0020 | The fan-out advances runs in lockstep so one batch serves a whole step: §12.2's discount is functionally required by the ceiling, and per-run submission would need 864,000 batches against an hours-SLA API instead of 24 | M6 |
 | 0021 | The dip test is implemented from its definition with a memoised Monte Carlo uniform null and validated against closed-form cases, rather than transcribing Hartigan's FORTRAN or adding a dependency to the pinned stack | M6 |
 | 0022 | Aggregation runs as `cascade_sim`: §2.2's PHASE 3 / PHASE 4 boundary is enforced by the label grant, so a forecast cannot be conditioned on the outcome it will be scored against | M6 |
+| 0023 | A CC-NEWS unit is one WARC file and the pending queue is ordered depth-major by scenario demand; chronological month units left a 1.76M-chunk corpus with 99.6% of its evidence before 2018-04 against 169 of 180 cutoffs after 2024-01 | M2 (found at M7) |
+| 0024 | Report figures are SVG written from the pinned stack; Appendix D names `.png` and the stack has no plotting library, and matplotlib/scipy/sklearn are present here only as undeclared transitive dependencies of the embed extra | M7 |
+| 0025 | Ablation factors A (`causal_decomposition`) and C (`grounding`) are mechanisms, not configuration fields: both were read nowhere outside `config.py`, so six of the twelve cells would have executed as duplicates and the headline deltas would have been precise nulls | M7 |
 
 ---
 
 ## 8. Open questions — resolve before the milestone that needs them
 
-**Q1 (M7): ablation replicate count.** Appendix C gives the D factor as
-`n ∈ {200, 1}` per cell, while §10.3 and §12.3 say the 11 non-headline cells
-run at "90 scenarios × 30 replicates". These cannot both be literally true for
-a D=200 cell. The likely reading is that D is the *design* factor and 30 is the
-*budget* cap applied to non-headline cells, so a D=200 ablation cell is
-executed at 30 replicates. `configs/ablations/*.yaml` currently encode the D
-factor; `ensemble.ablation_replicates` (30) exists for the cap. **The M7 grid
-driver must state which it applies, in the report,** because the ensemble
-contribution estimate depends on it. Do not resolve this silently.
+**Q1 (M7): ablation replicate count. — RESOLVED at M7.** Appendix C gives the
+D factor as `n ∈ {200, 1}` per cell, while §10.3 and §12.3 say the 11
+non-headline cells run at "90 scenarios × 30 replicates". These cannot both be
+literally true for a D=200 cell.
+
+The resolution is a **flag with a default, not an assumption**:
+`cascade eval grid --replicate-policy {budget_capped,design}`, defaulting to
+`budget_capped`. Under it, D is the *design* factor and 30
+(`ensemble.ablation_replicates`) is a *budget cap* applied to the 11
+non-headline cells; the headline cell always runs at the full D. `design` runs
+every cell at its D factor, which is what Appendix C says and what §12.3's
+29,700-run line does not fund. Scenario subsampling follows the same reading:
+`ensemble.ablation_scenarios` (90) caps the non-headline cells, chosen by a
+keyed hash of the scenario id so the subsample is outcome-independent,
+identical across cells and reproducible from the salt.
+
+`grid_replicates()` returns the count **and the sentence explaining it**, and
+`report.py` writes both into `headline.md` under "Replicate policy". The
+ensemble-contribution estimate therefore states the replicate count it was
+measured at, in the report, rather than leaving a reader to infer it from a run
+count.
 
 **Q2 (M1): base-rate control vs. the other inclusion rules. — RESOLVED at M1,
 see ADR-0008.** Precedence, weakest sacrificed first: (1) eligibility is
@@ -1071,3 +1101,228 @@ moving corpus with drifting indexes measures neither, so the number is not
 worth having yet. **Re-run `cascade retrieval index` and then
 `cascade retrieval bench` once `cascade corpus build` stops**; until then M3's
 acceptance figures remain the ones measured against 409,899 chunks.
+
+### M7 — Assay: the evaluation harness · *implemented and tested end to end; the study numbers remain blocked on M4's credential*
+
+Shipped: `cascade/eval/` — pure `metrics.py` (Brier, BSS, Murphy with its
+binning residual, clipped log loss, ECE/MCE, mid-rank AUC, Wilson, isotonic by
+pool-adjacent-violators), pure `stats.py` (paired percentile bootstrap over
+scenarios, Holm–Bonferroni, Pearson/Spearman with permutation p-values), pure
+`score.py` (metric assembly, the salt-keyed recalibration split, §9.2's
+dispersion finding), pure `ablation.py` (Appendix C's grid, the Q1 replicate
+policy, the scenario subsample, the comparison family), pure `panel.py` (the
+A=off generic persona panel), pure `figures.py` (four SVG figures),
+`baselines.py` (§10.2's five), `report.py` (Appendix D), `schema.py`,
+`store.py`; migrations 011–013 (`study_reports`, `forecasts.policy`, the eval
+grants); `cascade eval status|score|baselines|estimate|grid|significance|prompt-audit`
+and `cascade report`; ADRs 0023–0025. Scale: **3,207 lines** across 11 modules
+in `eval/`.
+
+**Measured acceptance values — 2 of 3 met on the mechanism; the study figures
+are blocked upstream.**
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | All 12 ablation cells executed; all 5 baselines scored | **4 of 12 cells and 1 of 5 baselines produced.** C09–C12 ran end to end (the panel arm needs no compiled graph) at 40 scenarios under the stand-in decider; climatology scored over all **180**. The eight decomposition cells and the two single-model baselines need M4's graphs and the credential; `cascade eval grid` and `cascade eval baselines` exit 3 naming the missing input | **BLOCKED** |
+| 2 | Brier, BSS, Murphy, ECE, AUC, reliability diagram, per-domain table | **PASS, measured.** Climatology over the sealed 180: Brier **0.250000**, BSS vs climatology **0.0000**, log loss **0.693147**, AUC **0.5000**, ECE **0.0000**, MCE **0.0000**, Murphy REL **0.000000** − RES **0.000000** + UNC **0.250000**, binning residual **+0.000000**. Every one is the closed-form value for a constant base-rate forecast at a 0.5 base rate, which is what makes it a validation of the metric stack rather than a printout | **PASS** |
+| 3 | Paired bootstrap CIs with Holm adjustment; report artifact written | **PASS, measured.** Three comparisons at B = 10,000 over 40 paired scenarios, Holm-adjusted; e.g. C10 − C09 = **−0.003764**, 95% CI **[−0.019230, +0.011589]**, p 0.6424, Holm p\* 1.0. `cascade report` wrote `reports/study_20260914T1756Z/` with all ten Appendix D files and four SVG figures | **PASS** |
+
+CI: ruff clean, black clean, mypy strict clean (**94 files**). **1,255 tests
+pass, 0 fail** -- the full suite including integration and leakage against live
+services (4 m 43 s); 1,133 of them run offline with no services at all. M7
+added **313**.
+
+**Previous-phase issues cleared before M7 started.**
+
+- **M2 criterion 1 is met.** The corpus passed the 1.30M target during the gap
+  between M6 and M7 and stands at **1,950,912 chunks across 492,270
+  documents** — 150% of target. `cascade corpus verify` exits **0**. The
+  original M2 verdict of SHORT is superseded.
+
+- **…and the corpus was still wrong, which the chunk count could not show.**
+  Measured at 1,764,890 chunks: **99.6% of the evidence predated 2018-04**
+  while **169 of 180 scenario cutoffs fall in 2024 or later**. Every M2 and M3
+  criterion held over a body of evidence that, for the scenarios the study
+  actually forecasts, was six to eight years stale. Two causes, neither a bug
+  in any single function: units were walked in key order, which for every
+  date-keyed source is chronological, so an interrupted multi-day ingest leaves
+  a corpus complete at the start of the window and empty at the end; and a
+  CC-NEWS unit was a whole month marked `done` after a bounded, shallow visit,
+  which froze that month's depth permanently because completed units are
+  skipped. `corpus.end_year` was also 2024 against cutoffs running to 2026-09.
+
+  ADR-0023 fixes all three: a CC-NEWS unit is now one WARC file (`YYYY/MM#k`),
+  the pending queue is sorted `(depth, −demand, key)` so it sweeps the whole
+  span before deepening any month, and demand is a pure function of the
+  scenario cutoffs — outcome-independent, the same precedent ADR-0010 set for
+  per-scenario Wikipedia anchoring. Month-level `done` rows are read as
+  covering the twelve files they actually reached, so no completed work is
+  re-fetched. `_prefetch` restores the fetch/compute overlap that
+  intra-unit parallelism used to provide.
+
+  Measured over one bounded breadth pass (46 file units, ~3 hours, same
+  pipeline and same politeness budgets — only the queue order changed):
+
+  | | before | after |
+  |---|---|---|
+  | chunks published after 2018-04 | ~4,300 | **189,679** |
+  | median admissible chunks in an 18-month window | 6,816 | **67,590** |
+  | minimum, over all 180 scenarios | 415 | **1,699** |
+  | median staleness at the cutoff | 7 days | **1 day** |
+  | maximum staleness | 59 days | **23 days** |
+
+  `cascade corpus coverage` is the measurement, and it exits 3 when any
+  scenario falls below `corpus.coverage_min_chunks` in its window. It and
+  `cascade corpus verify` are separate gates: the first cannot detect an empty
+  corpus and the second cannot detect this.
+
+- **The index pass and the M3 re-benchmark, blocked since M3, are unblocked.**
+  `cascade retrieval index` after the ingest stopped: **created 10, rebuilt 21,
+  kept 16, skipped 5 empty in 8.6 s**; `cascade retrieval verify` reports
+  **47/47** partitions correctly sized and exits 0. The two
+  `tests/integration/test_chronofence.py` failures that the growing corpus
+  caused are green again. This is ADR-0012's documented behaviour, not a
+  defect: sizing is a function of measured rows, and an actively growing corpus
+  keeps drifting.
+
+**Two of the four ablation factors were inert switches** (ADR-0025). Measured
+by grepping the package for each flag at the start of the milestone:
+`information_asymmetry` was read by `derive_policies`, `ensemble.replicates` by
+the fan-out — and `causal_decomposition` and `grounding` appeared **only in
+`cascade/config.py`**. The twelve-cell grid would have executed as **four
+distinct configurations**: C09–C12 would have run the compiled graph and
+produced forecasts identical to C05–C08, and every `parametric_only` cell would
+have retrieved normally. The headline `+0.035` and the grounding contribution
+would have come back as precise nulls with confidence intervals and
+Holm-adjusted p-values attached, and nothing downstream could have detected it —
+a paired bootstrap on two identical columns returns `[0, 0]`, which reads as a
+finding.
+
+Both are now mechanisms. A=off builds a deterministic generic persona panel
+(`eval/panel.py`) that the *same* kernel runs — same 24 steps, same arbiter,
+same seeded draw plan — so the only thing that varies is where the structure
+came from; a separate debate engine would have confounded "no decomposition"
+with "different engine". C=parametric_only opens no Chronofence connection,
+loads no embedder, and tells the agent that retrieval was *disabled* rather
+than that nothing was found, because those are different facts and an agent
+told the wrong one reasons differently about its own ignorance.
+`tests/unit/test_ablation_factors_are_read.py` asserts both behaviourally.
+
+**Q1 is resolved as a flag, not an assumption.** `--replicate-policy
+{budget_capped,design}`, defaulting to `budget_capped`: D is Appendix C's
+design factor, `ensemble.ablation_replicates` (30) is §10.3/§12.3's budget cap
+on the 11 non-headline cells, and the headline cell always runs at full D.
+`ensemble.ablation_scenarios` (90) caps the subsample the same way, chosen by a
+keyed hash of the scenario id — outcome-independent, identical across cells so
+the capped cells pair with each other exactly, and reproducible from the salt.
+`grid_replicates()` returns the count **and the sentence explaining it**, and
+the report prints every one under "Replicate policy".
+
+**The panel arm logs ~182 decisions per run, not 116.6.** Measured over 2,480
+runs at 40 scenarios: C09 182.4, C10 181.9, C11 182.5, C12 181.9. The panel's
+four factors are contested by all fourteen panelists, so factor movement is
+driven by actions rather than by the exogenous walk and the scheduler pins near
+its 8-of-14 cap. This is a ~56% overrun against §12.1's per-run cost model for
+the A=off cells specifically. It is **reported, not tuned**: adjusting the
+panel's volatility or lever weights until the rate lands on 34.7% is exactly
+the steering §1 forbids, and the number is a property of the arm.
+
+**Defects found and fixed at M7** (each has a regression test):
+
+- **The isotonic fit did not pool ties, though its docstring said it did.**
+  Two scenarios forecast at the same probability landed in *different* blocks
+  with different fitted values, so the step function was two-valued at that x
+  and `searchsorted` picked a branch by tie-break rather than by data. Measured
+  on `p = [0.0, 0.5, 0.5]`, `y = [0, 0, 1]`: every point mapped to 0.0 and the
+  Brier on the fit's **own training set doubled**, which is the one thing
+  isotonic regression cannot do. Found by a property test, not by inspection.
+- **The Brier was only approximately permutation-invariant.** Float addition is
+  not associative, so summing the same squared errors in two orders differed in
+  the last ULP — invisible at six decimal places and very visible in a
+  committed artifact, where a re-run whose forecasts loaded in a different
+  order would diff `metrics.json` with no change behind it. Accumulation is now
+  sorted, as the arbiter's already was (§8.1), and `metrics.brier` and
+  `metrics.murphy.brier` are now bit-identical rather than merely close.
+- **A late-binding closure in the grid driver.** `completed=lambda ...:
+  completed_replicates(settings, ...)` captured the loop variable, so every
+  cell would have resumed against whichever configuration the loop ended on.
+  Caught by ruff's B023 and fixed with a factory that binds once.
+- **A forecast collapsed from stand-in runs was indistinguishable from a study
+  result.** M5 stamps `policy` on a run because "a footnote is not a mechanism;
+  the column is", and the same argument had not been applied one level up.
+  Migration 012 carries the decider onto the forecast, derived from the runs
+  behind it, with `mixed` as a reported defect state rather than a silent
+  resolution; migration 013 adds `none` for climatology, which has no decider
+  at all and for which claiming one is checkable and false. The report prints
+  the warning *above* the headline Brier, not beside it.
+- **`cascade evaluate` and `cascade report` were `_not_yet` stubs.** `report`
+  is now the Appendix D writer; `evaluate` is a deprecated alias that names
+  `cascade eval` rather than failing with click's "no such command", because
+  §13's command list still names it.
+
+Design decisions recorded (full reasoning in the ADRs):
+
+- **Figures are SVG, not PNG** (ADR-0024). Appendix D names `.png`; the pinned
+  stack has no plotting library. `matplotlib`, `scipy` and `scikit-learn` are
+  all importable here and **none is declared** — they arrive as transitive
+  dependencies of the optional `embed` extra, so a figure importing matplotlib
+  would work on this machine, work in CI, and fail on a clean checkout of the
+  declared dependency set, which is where a reproduction attempt starts.
+  `manifest.json` records the deviation. The same argument produced
+  hand-written AUC, Wilson, isotonic, Holm and permutation tests: these are the
+  numbers the study *is*, and a headline that depends on an undeclared package
+  is a headline that cannot be reproduced.
+- **§14.3's report invariant is a static check.** `tests/unit/test_eval_report.py`
+  parses every module on the report path and fails on a float literal equal to
+  any figure in §1's measurement contract — 0.141, 0.203, 0.035, 0.027, 0.008
+  and the rest. The guard is itself tested against a synthetic violation,
+  because a guard that cannot fail is not a guard.
+- **`sample_index` joins the LLM cache domain, conditionally.** The cache is
+  content-addressed, so 200 identical self-consistency requests would have been
+  one recording replayed 200 times — an ensemble with sigma exactly zero,
+  making the fair-compute baseline look structurally incapable of dispersion
+  for a reason that is an artefact of the cache. It is added to the key only
+  when non-zero, so every recording made before the field existed still
+  resolves, and it never reaches the wire.
+- **The comparison family is every testable comparison, not five.** §10.4 sizes
+  it as "twelve cells plus five baselines", so Holm is applied across the
+  headline readings *and* every available cell against the headline. Untestable
+  pairs are excluded: a family padded with hypotheses nothing can test inflates
+  the multiplier and weakens every surviving result, which is conservative in
+  the wrong way.
+- **An unparseable baseline answer is dropped and counted, never scored 0.5.**
+  For the memorisation probe that substitution reads as reassurance (§4.4);
+  here it reads as a *well-calibrated* baseline, which is the direction that
+  flatters the system under test and is no more honest for it.
+
+Improvements beyond the roadmap, implemented rather than suggested:
+
+- **`cascade eval estimate`** applies §12.4's "no full phase launches without
+  it" to the baseline phase, which the roadmap left without one. The
+  self-consistency baseline alone is 36,000 calls and the single largest block
+  of the `baseline` ceiling; the command samples, extrapolates, and exits **2**
+  on a projected breach.
+- **`cascade eval prompt-audit`** fills in §1.3's before/after Brier from the
+  measurement rather than from a typed-in number, and updates only those two
+  columns so the summary and rationale recorded at the time of the change
+  cannot be edited afterwards to match the result.
+- **`study_reports`** ties each written report to the sealed split it was
+  computed against, so a report copied, renamed, or written before the registry
+  moved is visible without opening the directory.
+- **A blocked study is a real artifact.** `cascade report` exits 0 with a "Not
+  produced" section naming every quantity that could not be measured, in
+  `headline.md` and in `manifest.json`. Making it exit non-zero would mean the
+  only way to produce a report is to have finished, and the record of what was
+  *not* measurable is the thing a blocked milestone most needs to publish.
+
+Deferred, with reasons:
+
+- **The eight decomposition cells, the two single-model baselines, and every
+  study figure** → 180 compiled graphs, which need `CASCADE_ANTHROPIC_API_KEY`.
+  Everything downstream of the graphs is built, wired and tested; nothing
+  downstream of the credential can be measured.
+- **Langfuse reconciliation of `cost_ledger.json`** → M8's criterion (§12.4
+  puts it at the end of each phase and §14.2 makes it an M8 acceptance test).
+  The ledger reads the meter checkpoints and says so.
+- **Parquet/DuckDB export** → still nothing to export; `duckdb` and `pyarrow`
+  are pinned and uninstalled.

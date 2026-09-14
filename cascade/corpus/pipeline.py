@@ -18,13 +18,15 @@ nothing for reasons that look like an empty archive.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from cascade.config import Settings
 from cascade.corpus.chunker import chunk_text
+from cascade.corpus.coverage import demand_profile, order_units
 from cascade.corpus.embed import Embedder
 from cascade.corpus.fetch import Fetcher
 from cascade.corpus.normalize import DedupeIndex, deduplicate, validate
@@ -118,6 +120,23 @@ def _wikipedia_requests(settings: Settings) -> dict[str, list[wikipedia.Snapshot
     return units
 
 
+def _scenario_cutoffs(settings: Settings) -> list[datetime]:
+    """The registry's cutoffs, which are what the ingest is trying to cover.
+
+    Reads ``scenarios`` only -- a cutoff is not an outcome, and
+    ``scenario_labels`` is not touched here or anywhere in the corpus
+    pipeline (invariant 2). An empty registry is not an error: ordering then
+    degrades to breadth-first chronological, which is what it was before
+    demand existed.
+    """
+    from cascade.ledger.store import load_scenarios
+
+    try:
+        return [scenario.cutoff_ts for scenario in load_scenarios(settings, role="admin")]
+    except Exception:  # noqa: BLE001 -- a corpus build must not require a registry
+        return []
+
+
 def _units_for(settings: Settings, source: str) -> list[str]:
     corpus = settings.corpus
     span = {"start_year": corpus.start_year, "end_year": corpus.end_year}
@@ -128,7 +147,7 @@ def _units_for(settings: Settings, source: str) -> list[str]:
     if source == "gdelt":
         return gdelt.unit_keys(**span)
     if source == "ccnews":
-        return ccnews.unit_keys(**span)
+        return ccnews.unit_keys(**span, max_files=corpus.ccnews_max_files)
     if source == "wikipedia":
         return sorted(_wikipedia_requests(settings))
     raise ValueError(f"unknown corpus source: {source}")
@@ -162,45 +181,119 @@ def _documents_for(
 
 
 def _ccnews_unit(settings: Settings, unit_key: str, fetcher: Fetcher) -> Iterator[RawDocument]:
-    """Stream a bounded number of WARC files for one month, in parallel.
+    """Stream one WARC file -- the k-th of its month -- as one unit.
 
-    Measured single-stream, this source runs at ~26% CPU: almost all of the
-    wall time is spent waiting on a ~1 GB download while the tokenizer and the
-    GPU sit idle. WARC files are independent, so they are fetched concurrently
-    and the CPU-bound stages downstream get a steady supply.
+    The month's path list is fetched to resolve k, which costs one small
+    gzipped request per unit. That is the price of file-level resumability:
+    the alternative is caching the list across units, which would make a
+    unit's meaning depend on what ran before it in the same process.
 
-    Each worker gets its **own** ``Fetcher``. Sharing one would serialise the
-    downloads behind that fetcher's rate limiter, which is exactly what this
-    is trying to avoid, and ``httpx.Client`` connection reuse across threads is
-    not what the limiter is for.
+    A month whose list is shorter than k yields nothing and the unit is
+    recorded done-and-empty, because a file that does not exist is not an
+    outage. A month with no list at all raises, and the unit is recorded
+    failed -- `unit_keys` already excludes the months the collection does not
+    cover, so that case is a real fetch failure.
     """
     corpus = settings.corpus
-    # A missing month propagates: `unit_keys` already excludes the months the
-    # collection does not cover, so a failure here is a real outage and should
-    # be recorded as a failed unit rather than an empty one.
-    paths = ccnews.month_paths(fetcher, unit_key=unit_key)
-    selected = paths[: corpus.ccnews_max_files]
-    if not selected:
+    month, index = ccnews.split_unit(unit_key)
+    paths = ccnews.month_paths(fetcher, unit_key=month)
+    if index >= len(paths):
+        return
+    yield from ccnews.load_warc(
+        fetcher, path=paths[index], max_records=corpus.ccnews_max_records_per_file
+    )
+
+
+def _prefetch(
+    unit_keys: Sequence[str],
+    *,
+    workers: int,
+    load: Callable[[str], list[RawDocument]],
+) -> Iterator[tuple[str, list[RawDocument] | Exception]]:
+    """Fetch ahead by ``workers`` units, yielding results in submission order.
+
+    Fetching and the CPU-bound stages downstream -- chunking, tokenizing,
+    embedding -- alternate rather than overlap: measured single-stream, this
+    pipeline spent ~75% of wall time waiting on a download with the tokenizer
+    idle. Overlapping them is worth ~1.8x, and the earlier version bought it
+    by streaming several WARC files *inside* one unit. That is no longer
+    available, because a unit is now one file (ADR-0023) -- so the overlap
+    moves up a level, to a bounded lookahead across units.
+
+    Order is preserved, which is what keeps this an optimisation rather than a
+    behaviour change: units are committed and marked in exactly the sequence
+    they would have run in sequentially, so an interruption leaves the same
+    state either way. ``load`` is called from worker threads and must not
+    share a rate limiter or an HTTP client between calls.
+
+    An exception is yielded rather than raised so one unreachable unit is
+    recorded failed and the rest of the queue still runs.
+    """
+    if workers <= 1:
+        for unit_key in unit_keys:
+            try:
+                yield unit_key, load(unit_key)
+            except Exception as exc:  # noqa: BLE001 -- reported per unit, never fatal
+                yield unit_key, exc
         return
 
-    workers = max(1, min(corpus.fetch_workers, len(selected)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending: deque[tuple[str, Future[list[RawDocument]]]] = deque()
+        upcoming = iter(unit_keys)
+        try:
+            while True:
+                while len(pending) < workers:
+                    nxt = next(upcoming, None)
+                    if nxt is None:
+                        break
+                    pending.append((nxt, pool.submit(load, nxt)))
+                if not pending:
+                    return
+                unit_key, future = pending.popleft()
+                try:
+                    yield unit_key, future.result()
+                except Exception as exc:  # noqa: BLE001 -- reported per unit
+                    yield unit_key, exc
+        finally:
+            # A consumer that stops early (``--max-units``, a budget abort)
+            # must not leave downloads running against the politeness budget.
+            for _, future in pending:
+                future.cancel()
 
-    def drain(path: str) -> list[RawDocument]:
+
+def _unit_loader(
+    settings: Settings,
+    source: str,
+    fetchers: dict[str, Fetcher],
+    wiki_units: dict[str, list[wikipedia.SnapshotRequest]],
+) -> tuple[Callable[[str], list[RawDocument]], int]:
+    """Return a thread-safe loader for ``source`` and how many may run at once.
+
+    Only CC-NEWS is prefetched. It is the source with the volume, and it is
+    the only one whose upstream is a static file store rather than a rate-
+    limited API -- Common Crawl publishes no request floor, while GDELT
+    publishes a five-second one and EDGAR ten per second. Running those
+    concurrently would spend a politeness budget the ingest depends on.
+    """
+    corpus = settings.corpus
+    if source != "ccnews":
+
+        def sequential(unit_key: str) -> list[RawDocument]:
+            return list(_documents_for(settings, source, unit_key, fetchers, wiki_units))
+
+        return sequential, 1
+
+    def concurrent(unit_key: str) -> list[RawDocument]:
+        # Its own Fetcher per call: sharing one would serialise the downloads
+        # behind that fetcher's rate limiter, which is what this avoids, and
+        # `httpx.Client` reuse across threads is not what the limiter is for.
         worker = Fetcher(requests_per_second=corpus.requests_per_second, user_agent=corpus.contact)
         try:
-            return list(
-                ccnews.load_warc(worker, path=path, max_records=corpus.ccnews_max_records_per_file)
-            )
-        except Exception:  # noqa: BLE001 -- one bad WARC must not fail the month
-            return []
+            return list(_ccnews_unit(settings, unit_key, worker))
         finally:
             worker.close()
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        # Results are consumed in submission order so the ingest stays
-        # deterministic given the same WARC list.
-        for documents in pool.map(drain, selected):
-            yield from documents
+    return concurrent, max(1, corpus.fetch_workers)
 
 
 def _chunks_for(document: DatedDocument, settings: Settings, embedder: Embedder) -> list[Chunk]:
@@ -277,6 +370,11 @@ def run_ingest(
         ),
     }
     wiki_units = _wikipedia_requests(settings) if "wikipedia" in selected else {}
+    # Computed once for the whole run: it is a function of the registry, which
+    # is sealed, so recomputing it per source could only introduce drift.
+    demand = demand_profile(
+        _scenario_cutoffs(settings), lookback_months=corpus.coverage_lookback_months
+    )
 
     try:
         for source in selected:
@@ -290,26 +388,33 @@ def run_ingest(
                 continue
 
             done = completed_units(settings, source)
+            if source == "ccnews":
+                # A month-level `done` row predates file-level units and covers
+                # the files that month's ingest actually read (ADR-0023).
+                done = {
+                    expanded
+                    for unit in sorted(done)
+                    for expanded in ccnews.expand_legacy_unit(unit)
+                }
             pending = [unit for unit in units if unit not in done]
             source_report.units_skipped = len(units) - len(pending)
+            pending = [plan.unit_key for plan in order_units(pending, demand=demand)]
             if max_units_per_source is not None:
                 pending = pending[:max_units_per_source]
 
-            for unit_key in pending:
-                try:
-                    raw_documents = list(
-                        _documents_for(settings, source, unit_key, fetchers, wiki_units)
-                    )
-                except Exception as exc:  # noqa: BLE001 -- one unit must not kill a run
+            load, workers = _unit_loader(settings, source, fetchers, wiki_units)
+            for unit_key, fetched in _prefetch(pending, workers=workers, load=load):
+                if isinstance(fetched, Exception):
                     source_report.units_failed += 1
                     mark_unit(
                         settings,
                         source=source,
                         unit_key=unit_key,
                         state="failed",
-                        detail=f"{type(exc).__name__}: {exc}",
+                        detail=f"{type(fetched).__name__}: {fetched}",
                     )
                     continue
+                raw_documents = fetched
 
                 source_report.documents_seen += len(raw_documents)
                 validated: list[DatedDocument] = []

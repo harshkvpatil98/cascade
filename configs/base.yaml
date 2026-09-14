@@ -114,6 +114,12 @@ retrieval:
 ensemble:
   replicates: 200
   ablation_replicates: 30
+  # §10.3/§12.3 size the 11 non-headline cells at "90 scenarios x 30
+  # replicates". The subsample is a keyed hash of the scenario id, so it is the
+  # same 90 for every cell, reproducible from the study salt, and independent
+  # of the outcome. Paired comparisons against the 180-scenario headline pair
+  # on the intersection and report the paired count.
+  ablation_scenarios: 90
   bootstrap_b: 10000
   sigma_multimodal_threshold: 0.30
 
@@ -130,6 +136,11 @@ flags: # ablation switches
   causal_decomposition: true
   information_asymmetry: true
   grounding: chronofence # or parametric_only
+  # Size of the generic persona panel used when causal_decomposition is off
+  # (Appendix C factor A). 14 is §3.1's design mean actor count, so the A=off
+  # arm differs from A=on in where the structure came from and not in how many
+  # agents there are.
+  panel_actors: 14
 
 llm:
   mode: replay # record | replay | live -- replay is the safe default
@@ -176,7 +187,10 @@ corpus: # evidence corpus (spec §3.2)
   # "Name email@domain" form. Replace with a real address before a long run.
   contact: "Cascade Research cascade-research@example.com"
   start_year: 2016
-  end_year: 2024
+  # Scenario cutoffs run to 2026-09 (M1, measured), and evidence for a 2026
+  # scenario can only come from 2026. 2024 left the last two years of the
+  # study with no source months generated at all.
+  end_year: 2026
   # 512/64 per spec §3.2, counted with the embedding model's own tokenizer.
   chunk_max_tokens: 512
   chunk_overlap_tokens: 64
@@ -190,8 +204,23 @@ corpus: # evidence corpus (spec §3.2)
   # CC-NEWS ingest is I/O bound -- a single WARC stream leaves the CPU idle
   # ~75% of the time. Files are independent, so they are streamed in parallel.
   fetch_workers: 6
+  # A CC-NEWS unit is one WARC file (ADR-0023); this is how many files per
+  # month the queue generates, i.e. the maximum depth a month can reach. The
+  # queue sweeps depth-major, so raising it adds a later pass rather than
+  # deepening the months already visited.
   ccnews_max_files: 12
   ccnews_max_records_per_file: 12000
+  # A document counts as evidence for a scenario if it was published within
+  # this many months before that scenario's cutoff. Drives ingest ordering and
+  # the `cascade corpus coverage` report; it is a reporting window, not a
+  # retrieval filter -- Chronofence admits everything strictly before the
+  # cutoff regardless.
+  coverage_lookback_months: 18
+  # A scenario is reported under-covered below this many admissible chunks in
+  # that window. `cascade corpus coverage` exits 3 when any scenario is under
+  # it, so a corpus that is over its chunk target but covers the wrong years
+  # cannot pass silently.
+  coverage_min_chunks: 200
   wikipedia_max_articles_per_scenario: 6
 
 database:

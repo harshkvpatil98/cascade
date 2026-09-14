@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
 import numpy as np
 
@@ -92,6 +93,7 @@ def collapse(
     mean_events: float = 0.0,
     mean_steps: float = 0.0,
     absorbed_runs: int = 0,
+    policy: Literal["agent", "heuristic", "mixed", "none"] = "agent",
 ) -> Forecast:
     """Collapse one (scenario, config)'s replicates into a forecast (spec §9.1).
 
@@ -132,6 +134,7 @@ def collapse(
         mean_events=mean_events,
         mean_steps=mean_steps,
         absorbed_runs=absorbed_runs,
+        policy=policy,
     )
 
 

@@ -33,7 +33,16 @@ from datetime import UTC, datetime
 from cascade.corpus.fetch import Fetcher, html_to_text
 from cascade.corpus.schema import RawDocument
 
-__all__ = ["PATHS_URL", "extract_published_at", "load_warc", "month_paths", "unit_keys"]
+__all__ = [
+    "LEGACY_MONTH_FILES",
+    "PATHS_URL",
+    "expand_legacy_unit",
+    "extract_published_at",
+    "load_warc",
+    "month_paths",
+    "split_unit",
+    "unit_keys",
+]
 
 DATA_URL = "https://data.commoncrawl.org"
 PATHS_URL = f"{DATA_URL}/crawl-data/CC-NEWS"
@@ -67,19 +76,62 @@ _CONTENT_LENGTH = re.compile(rb"^Content-Length:\s*(\d+)\s*$", re.I | re.M)
 FIRST_YEAR = 2016
 FIRST_MONTH = 8
 
+# The `corpus.ccnews_max_files` in force while CC-NEWS units were keyed by
+# month alone. It is the depth a `done` month-level row actually reached, and
+# it is a constant rather than a config read because the rows it describes
+# were written under the old value and cannot be re-interpreted by a later
+# edit to the config.
+LEGACY_MONTH_FILES = 12
 
-def unit_keys(*, start_year: int, end_year: int) -> list[str]:
-    """One unit per month; a month's WARC list is fetched as a whole.
+
+def unit_keys(*, start_year: int, end_year: int, max_files: int = LEGACY_MONTH_FILES) -> list[str]:
+    """One unit per WARC file: ``YYYY/MM#k`` for the k-th file of that month.
 
     Clamped to the collection's actual start so a configured range that
     reaches further back does not manufacture missing months.
+
+    **Why a file and not a month.** A CC-NEWS month holds hundreds of WARC
+    files and the ingest reads a bounded prefix of them, so a month-level unit
+    conflates two different facts -- "this month has been visited" and "this
+    month has been exhausted". Marking the month done at the first, shallow
+    visit makes the depth permanent: no later pass can deepen it, because
+    completed units are skipped. Keying on the file makes depth a coordinate
+    the scheduler can order by, which is what lets
+    :func:`cascade.corpus.coverage.order_units` sweep the whole span before
+    deepening any month.
     """
     return [
-        f"{year:04d}/{month:02d}"
+        f"{year:04d}/{month:02d}#{index}"
         for year in range(max(start_year, FIRST_YEAR), end_year + 1)
         for month in range(1, 13)
         if (year, month) >= (FIRST_YEAR, FIRST_MONTH)
+        for index in range(max_files)
     ]
+
+
+def split_unit(unit_key: str) -> tuple[str, int]:
+    """Split ``YYYY/MM#k`` into its month and file ordinal.
+
+    A bare ``YYYY/MM`` -- the shape written before this change -- reads as
+    file 0, so a legacy key never raises here; :func:`expand_legacy_unit` is
+    what stops it from being *treated* as file 0 alone.
+    """
+    month, _, index = unit_key.partition("#")
+    return month, int(index) if index else 0
+
+
+def expand_legacy_unit(unit_key: str, *, max_files: int = LEGACY_MONTH_FILES) -> list[str]:
+    """Translate a month-level ``done`` row into the file units it covered.
+
+    Month-level units were written while ``corpus.ccnews_max_files`` was
+    :data:`LEGACY_MONTH_FILES`, so a completed month had ingested that many
+    files. Re-deriving the file keys from the constant preserves the work
+    rather than re-fetching it, and it is bookkeeping rather than a data
+    rewrite: the stored row is not touched, it is read as what it meant.
+    """
+    if "#" in unit_key:
+        return [unit_key]
+    return [f"{unit_key}#{index}" for index in range(max_files)]
 
 
 def month_paths(fetcher: Fetcher, *, unit_key: str) -> list[str]:

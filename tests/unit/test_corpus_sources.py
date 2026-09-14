@@ -184,10 +184,10 @@ def test_ccnews_units_start_where_the_collection_does() -> None:
     Generating them would turn a known gap into a stream of fetch failures
     that look like an outage.
     """
-    keys = ccnews.unit_keys(start_year=2015, end_year=2024)
-    assert keys[0] == "2016/08"
-    assert "2016/07" not in keys
-    assert keys[-1] == "2024/12"
+    keys = ccnews.unit_keys(start_year=2015, end_year=2024, max_files=2)
+    assert keys[0] == "2016/08#0"
+    assert not any(key.startswith("2016/07") for key in keys)
+    assert keys[-1] == "2024/12#1"
 
 
 @pytest.mark.parametrize(

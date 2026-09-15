@@ -215,3 +215,52 @@ class TestPrefetch:
         next(stream)
         stream.close()
         assert len(started) < 50
+
+
+class TestEmbedderOfflineFallback:
+    """A cached model must not need the network (M7 finding).
+
+    The weights are cached after the first load, but the loader still calls
+    the hub to check for a newer revision. A transient failure there took down
+    1 test and errored 12 more -- the whole leakage suite and the
+    date-monotonicity properties -- on a machine that already had the model.
+    """
+
+    def test_a_network_failure_retries_against_the_local_cache(self) -> None:
+        from cascade.corpus.embed import Embedder
+
+        calls: list[bool] = []
+
+        def factory(name: str, *, device: str, local_files_only: bool = False) -> str:
+            calls.append(local_files_only)
+            if not local_files_only:
+                raise ConnectionError("huggingface.co went away mid-stream")
+            return "model"
+
+        embedder = Embedder(model_name="BAAI/bge-small-en-v1.5")
+        assert embedder._construct(factory, device="cpu") == "model"
+        assert calls == [False, True]
+
+    def test_a_genuinely_absent_model_still_fails(self) -> None:
+        """The fallback can only succeed from a populated cache. A pinned model
+        that is not there has no substitution to fall back to."""
+        from cascade.corpus.embed import Embedder, EmbeddingUnavailable
+
+        def factory(name: str, *, device: str, local_files_only: bool = False) -> str:
+            raise OSError("no such model anywhere")
+
+        embedder = Embedder(model_name="BAAI/bge-small-en-v1.5")
+        with pytest.raises(EmbeddingUnavailable, match="local cache did not satisfy it"):
+            embedder._construct(factory, device="cpu")
+
+    def test_a_healthy_load_makes_one_call(self) -> None:
+        from cascade.corpus.embed import Embedder
+
+        calls: list[bool] = []
+
+        def factory(name: str, *, device: str, local_files_only: bool = False) -> str:
+            calls.append(local_files_only)
+            return "model"
+
+        assert Embedder(model_name="m")._construct(factory, device="cpu") == "model"
+        assert calls == [False]

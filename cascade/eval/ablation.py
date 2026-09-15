@@ -108,26 +108,32 @@ def grid_replicates(
     is that the ensemble contribution estimate depends on which reading is
     applied, so the report states which one it used rather than leaving a
     reader to infer it from a run count.
+
+    The sentence is written in the present tense because it describes what the
+    policy **prescribes**, not what happened: it is generated for all twelve
+    cells including ones that were never executed, and "ran at 30" would be a
+    claim about a cell with no runs. What a cell actually executed is
+    ``AblationCell.replicates_executed``, measured from its stored forecasts.
     """
     if policy == "design":
         return cell.replicates_design, (
-            f"{cell.cell_id} ran at its Appendix C design factor D="
-            f"{cell.replicates_design}; no budget cap was applied."
+            f"{cell.cell_id} runs at its Appendix C design factor D="
+            f"{cell.replicates_design}; no budget cap is applied."
         )
     if cell.is_headline:
         return cell.replicates_design, (
-            f"{cell.cell_id} is the headline cell and ran at the full "
+            f"{cell.cell_id} is the headline cell and runs at the full "
             f"D={cell.replicates_design}; the cap applies to the 11 others."
         )
     capped = min(cell.replicates_design, ablation_cap)
     if capped == cell.replicates_design:
         return capped, (
             f"{cell.cell_id} has D={cell.replicates_design}, which is already at or "
-            f"below the {ablation_cap}-replicate budget cap; it ran at D."
+            f"below the {ablation_cap}-replicate budget cap; it runs at D."
         )
     return capped, (
         f"{cell.cell_id} has Appendix C design factor D={cell.replicates_design} and "
-        f"ran at the {ablation_cap}-replicate budget cap of §10.3/§12.3. The "
+        f"runs at the {ablation_cap}-replicate budget cap of §10.3/§12.3. The "
         "ensemble contribution estimated from this cell is an estimate at "
         f"{capped} replicates, not at {cell.replicates_design}."
     )

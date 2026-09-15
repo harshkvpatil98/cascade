@@ -18,8 +18,8 @@ restated. **Never write a target value into a report code path. Never hardcode
 | Quantity | Target | Produced by |
 |---|---|---|
 | Backtested scenarios | 180 resolved binary questions | M1 |
-| Evidence corpus | ≥ 1.30M pre-cutoff chunks | M2 |
-| Retrieval p95 | < 15 ms, recall@20 > 0.92 | M3 |
+| Evidence corpus | ≥ 1.30M pre-cutoff chunks | M2 — met (1,950,912) |
+| Retrieval p95 | < 15 ms, recall@20 > 0.92 | M3 — **not met at 1.95M chunks**: 176.00 ms / 0.8950, see the M7 build-log entry |
 | Mean actors / scenario | 14 (range 8–20) | M4 |
 | Simulation horizon | 24 steps per run | M5 |
 | Runs | 200 × 180 = 36,000 | M6 |
@@ -172,8 +172,11 @@ cascade report             # write reports/study_{ts}/ (Appendix D)
 
 ## 7. Architecture decisions
 
-Twenty-two ADRs in `docs/adr/`. Twelve correct defects found in the spec; the
-rest record choices the spec left open.
+Twenty-five ADRs in `docs/adr/`. Fourteen correct defects found in the spec,
+and 0023 and 0025 correct defects found in **this build** -- an ingest order
+that satisfied every criterion while covering the wrong years, and two ablation
+factors that were configured, documented and inert. The rest record choices the
+spec left open.
 
 | ADR | Decision | Milestone |
 |---|---|---|
@@ -398,7 +401,9 @@ Additional decisions recorded at M1:
   manifest hash and (at M8) the event-log hash must agree on bytes, so there is
   one definition.
 
-### M2 — Evidence corpus · *pipeline complete, chunk target not reached*
+### M2 — Evidence corpus · *pipeline complete; chunk target not reached at the
+time of this entry, met before M7 — see the M7 carry-over section, which also
+records the coverage defect the chunk count could not show*
 
 Shipped: migration 003 (`documents` / `chunks` partitioned quarterly per
 ADR-0004, `corpus_ingest_state`, no DEFAULT partition); `cascade/corpus/` —
@@ -497,7 +502,10 @@ Deferred, with reasons:
   Chronofence latency work (§4.2) and wants the final row counts; building one
   now would only have to be rebuilt.
 
-### M3 — Chronofence · *complete, 4 of 5 acceptance criteria met*
+### M3 — Chronofence · *complete against a 409,899-chunk corpus, 4 of 5
+criteria met at the time. **Criteria 1 and 2 are withdrawn**: re-measured at
+M7 against 1,950,912 chunks, p95 is 176.00 ms and recall@20 is 0.8950 — see
+the M7 carry-over section*
 
 Shipped: migrations 004–007 (`chronofence_search` and `chronofence_search_exact`
 as SECURITY DEFINER with pinned `search_path` and `ivfflat.probes` per ADR-0002;
@@ -1102,7 +1110,9 @@ worth having yet. **Re-run `cascade retrieval index` and then
 `cascade retrieval bench` once `cascade corpus build` stops**; until then M3's
 acceptance figures remain the ones measured against 409,899 chunks.
 
-### M7 — Assay: the evaluation harness · *implemented and tested end to end; the study numbers remain blocked on M4's credential*
+### M7 — Assay: the evaluation harness · *implemented and tested end to end;
+the study numbers remain blocked on M4's credential, and the M3 re-benchmark
+run here fails both retrieval criteria at the corpus's new size*
 
 Shipped: `cascade/eval/` — pure `metrics.py` (Brier, BSS, Murphy with its
 binning residual, clipped log loss, ECE/MCE, mid-rank AUC, Wilson, isotonic by
@@ -1127,10 +1137,10 @@ are blocked upstream.**
 | 2 | Brier, BSS, Murphy, ECE, AUC, reliability diagram, per-domain table | **PASS, measured.** Climatology over the sealed 180: Brier **0.250000**, BSS vs climatology **0.0000**, log loss **0.693147**, AUC **0.5000**, ECE **0.0000**, MCE **0.0000**, Murphy REL **0.000000** − RES **0.000000** + UNC **0.250000**, binning residual **+0.000000**. Every one is the closed-form value for a constant base-rate forecast at a 0.5 base rate, which is what makes it a validation of the metric stack rather than a printout | **PASS** |
 | 3 | Paired bootstrap CIs with Holm adjustment; report artifact written | **PASS, measured.** Three comparisons at B = 10,000 over 40 paired scenarios, Holm-adjusted; e.g. C10 − C09 = **−0.003764**, 95% CI **[−0.019230, +0.011589]**, p 0.6424, Holm p\* 1.0. `cascade report` wrote `reports/study_20260914T1756Z/` with all ten Appendix D files and four SVG figures | **PASS** |
 
-CI: ruff clean, black clean, mypy strict clean (**94 files**). **1,255 tests
+CI: ruff clean, black clean, mypy strict clean (**94 files**). **1,259 tests
 pass, 0 fail** -- the full suite including integration and leakage against live
-services (4 m 43 s); 1,133 of them run offline with no services at all. M7
-added **313**.
+services (4 m 31 s); 1,137 of them run offline with no services at all. M7
+added **317**.
 
 **Previous-phase issues cleared before M7 started.**
 
@@ -1176,14 +1186,69 @@ added **313**.
   `cascade corpus verify` are separate gates: the first cannot detect an empty
   corpus and the second cannot detect this.
 
-- **The index pass and the M3 re-benchmark, blocked since M3, are unblocked.**
-  `cascade retrieval index` after the ingest stopped: **created 10, rebuilt 21,
-  kept 16, skipped 5 empty in 8.6 s**; `cascade retrieval verify` reports
-  **47/47** partitions correctly sized and exits 0. The two
-  `tests/integration/test_chronofence.py` failures that the growing corpus
-  caused are green again. This is ADR-0012's documented behaviour, not a
-  defect: sizing is a function of measured rows, and an actively growing corpus
-  keeps drifting.
+- **The index pass ran and the M3 re-benchmark finally completed — and it
+  fails both criteria.** `cascade retrieval index` after the ingest stopped:
+  **created 10, rebuilt 21, kept 16, skipped 5 empty in 8.6 s**; `cascade
+  retrieval verify` reports **47/47** partitions correctly sized and exits 0.
+  The two `tests/integration/test_chronofence.py` failures the growing corpus
+  caused are green again — ADR-0012's documented behaviour, not a defect.
+
+  `cascade retrieval bench` then ran to completion for the first time since M3,
+  on a static corpus with settled indexes and nothing else on the machine
+  (1,664.6 s wall, 10,000 queries across 180 distinct cutoffs, recall sample
+  reduced to 100 queries, **0** empty results):
+
+  | | M3, 409,899 chunks / 37 partitions | now, 1,950,912 / 47 | criterion |
+  |---|---|---|---|
+  | p50 | 10.95 ms | **161.45 ms** | - |
+  | **p95** | 13.43 ms | **176.00 ms** | **< 15 ms — FAIL** |
+  | p99 | 14.60 ms | 182.54 ms | - |
+  | min / max | 8.52 / 45.63 ms | 100.99 / 262.21 ms | - |
+  | **recall@20** | 0.9372 (500 queries) | **0.8950 (100 queries)** | **> 0.92 — FAIL** |
+
+  `cascade retrieval bench` exits **3**, so this cannot pass as success in CI.
+  **The M3 acceptance figures are withdrawn**: they were measured against a
+  corpus 4.8x smaller and are no longer the system's numbers.
+
+  **Diagnosis — three compounding causes, none of them a bug.** IVFFlat with
+  `lists = sqrt(rows)` and `probes = 40` scans about `40 x sqrt(n_p)` rows per
+  partition, so a query spanning the whole corpus scans about
+  `40 x Σ_p sqrt(n_p)`.
+
+  1. **Scan volume tripled.** `Σ_p sqrt(n_p)` measured at **5,727** now against
+     roughly 1,840 at M3's distribution — about **229,000 rows scanned per
+     query** against about 74,000. Centroid comparisons scale with the same
+     sum.
+  2. **Every partition is now real.** M3 noted that p95 "barely varies with the
+     cutoff" because "almost every query scans the same five large
+     partitions" — the other 32 held a few hundred rows each. The coverage fix
+     above populated 2018–2026, so a late-cutoff query now does **47 genuine
+     index scans** instead of five plus a long tail of trivial ones. Retrieval
+     got slower **because there is now evidence to retrieve**; the narrow
+     p50/p95 spread (161 / 176 ms) is what "every query does the same large
+     amount of work" looks like.
+  3. **The working set outgrew the cache.** `chunks` with its indexes is
+     **6,609 MB** (IVFFlat indexes alone **1,553 MB**) against
+     `shared_buffers` of **2 GB** and a 7.75 GiB container. At 409,899 chunks
+     the table was roughly 1.4 GB and sat inside shared_buffers.
+
+  Recall fell for the same structural reason: `probes` applies **per scan**
+  (ADR-0013), and 40 was the smallest value clearing 0.92 at M3's *effective*
+  fan-out of about five populated partitions. At 47 the merged top-20 is
+  assembled from 47 separate approximate top-20s and misses more — measured
+  min 0.1000, perfect on 44 of 100.
+
+  **The two criteria are traded against each other by one knob, so neither is
+  tunable in isolation.** Raising `probes` recovers recall and worsens latency;
+  lowering it does the reverse. Re-tuning it to make either number pass would be
+  exactly the steering §1 forbids, so nothing was tuned. The levers that could
+  genuinely resolve this are M3 design work and each needs its own measured
+  recall curve: coarser partitions (ADR-0004's dimension — `sqrt` is concave,
+  so merging partitions lowers `Σ sqrt(n_p)`), `lists` above `sqrt(rows)`,
+  raising `shared_buffers` and the container's memory, or HNSW in place of
+  IVFFlat, which pgvector 0.8 supports and which would be a stack substitution
+  requiring an ADR. **This is the open item M8 or a dedicated M3 revisit must
+  close, and it blocks quoting any latency figure for the study.**
 
 **Two of the four ablation factors were inert switches** (ADR-0025). Measured
 by grepping the package for each flag at the start of the milestone:
@@ -1193,10 +1258,13 @@ the fan-out — and `causal_decomposition` and `grounding` appeared **only in
 distinct configurations**: C09–C12 would have run the compiled graph and
 produced forecasts identical to C05–C08, and every `parametric_only` cell would
 have retrieved normally. The headline `+0.035` and the grounding contribution
-would have come back as precise nulls with confidence intervals and
-Holm-adjusted p-values attached, and nothing downstream could have detected it —
-a paired bootstrap on two identical columns returns `[0, 0]`, which reads as a
-finding.
+would have come back as nulls with confidence intervals and Holm-adjusted
+p-values attached, and nothing downstream could have detected it. Worse, it
+would not have looked broken: the run seed includes `config_id` (§8.2), so the
+duplicated cells draw different streams from the same configuration and the
+paired bootstrap returns a small interval straddling zero — indistinguishable
+from an honest "this factor does not help", which is a publishable finding. A
+literal `[0, 0]` would at least have been suspicious.
 
 Both are now mechanisms. A=off builds a deterministic generic persona panel
 (`eval/panel.py`) that the *same* kernel runs — same 24 steps, same arbiter,
@@ -1216,7 +1284,11 @@ on the 11 non-headline cells, and the headline cell always runs at full D.
 keyed hash of the scenario id — outcome-independent, identical across cells so
 the capped cells pair with each other exactly, and reproducible from the salt.
 `grid_replicates()` returns the count **and the sentence explaining it**, and
-the report prints every one under "Replicate policy".
+the report prints every one under "Replicate policy". The sentence is
+prescriptive: it states what the policy *applies*, because it is generated for
+all twelve cells including ones that never ran. What a cell actually executed
+is `AblationCell.replicates_executed`, measured from its stored forecasts --
+C09 and C11 executed at 30, C10 and C12 at 1.
 
 **The panel arm logs ~182 decisions per run, not 116.6.** Measured over 2,480
 runs at 40 scenarios: C09 182.4, C10 181.9, C11 182.5, C12 181.9. The panel's
@@ -1259,6 +1331,16 @@ the steering §1 forbids, and the number is a property of the arm.
   is now the Appendix D writer; `evaluate` is a deprecated alias that names
   `cascade eval` rather than failing with click's "no such command", because
   §13's command list still names it.
+- **A HuggingFace network blip took down the leakage suite.** The embedding
+  weights are cached after the first load, but the loader still calls the hub
+  to check for a newer revision -- so a mid-stream `RemoteProtocolError`
+  against huggingface.co failed 1 test and errored **12** more on a machine
+  that already had the model, including every poison-pill probe and the
+  date-monotonicity properties. `Embedder.load` now retries with
+  `local_files_only=True`, which is a parameter rather than an environment
+  variable because only `config.py` may touch the process environment and a
+  test enforces it. A model that is genuinely absent still fails, with both
+  errors in the message.
 
 Design decisions recorded (full reasoning in the ADRs):
 

@@ -25,14 +25,21 @@ Measured at the start of M7, by grepping the package for each flag:
 - **C** appeared **only** in `cascade/config.py`. Nothing else referenced it.
 
 So the twelve-cell grid would have executed as **four distinct
-configurations**. C09–C12 would have run the *compiled* graph and produced
-forecasts identical to C05–C08, and every `parametric_only` cell would have run
-with full Chronofence retrieval. The headline ablation deltas — `+0.035` for
+configurations**. C09–C12 would have run the *compiled* graph under the same
+settings as C05–C08, and every `parametric_only` cell would have run with full
+Chronofence retrieval. The headline ablation deltas — `+0.035` for
 decomposition and the grounding contribution — would have been measurements of
 nothing, reported with confidence intervals and Holm-adjusted p-values, and
-nothing downstream could have detected it. The paired bootstrap on two
-identical columns returns `[0, 0]`, which reads as a precise null rather than
-as a broken switch.
+nothing downstream could have detected it.
+
+**And it would not even have looked broken.** The run seed is
+`blake2b(scenario_id|config_id|replicate)` (§8.2), so C09 and C05 draw
+*different* random streams from the *same* configuration. The forecasts would
+not have been identical — they would have been two independent draws from one
+distribution, and the paired bootstrap would have returned a small interval
+straddling zero with a p-value near 1. That is indistinguishable from an honest
+"this factor does not help", which is a publishable finding. A literal `[0, 0]`
+would at least have been suspicious.
 
 This was not a missing feature so much as a missing *mechanism* behind a
 feature that had been configured, documented, tested and shipped since M0.

@@ -74,7 +74,7 @@ class Embedder:
             ) from exc
 
         device = self._resolve_device()
-        model = SentenceTransformer(self.model_name, device=device)
+        model = self._construct(SentenceTransformer, device=device)
         if self.use_fp16 and device != "cpu":
             # fp16 halves memory and roughly doubles throughput on MPS/CUDA.
             # Left off on CPU, where half precision is emulated and slower.
@@ -95,6 +95,38 @@ class Embedder:
                 f"{self.model_name} produces {dim}-d vectors but the schema stores "
                 f"halfvec({EMBEDDING_DIM}); the pin and the DDL disagree"
             )
+
+    def _construct(self, factory: Any, *, device: str) -> Any:
+        """Build the model, falling back to the local cache on a network blip.
+
+        The weights are cached on disk after the first load, but the loader
+        still calls out to the hub to check for a newer revision -- so a
+        transient HTTP failure takes down every test that needs an embedder,
+        including the leakage suite and the date-monotonicity properties.
+        Measured here: a mid-stream `RemoteProtocolError` against
+        huggingface.co failed 1 test and errored 12 more on a machine that
+        already had the model.
+
+        The retry passes ``local_files_only=True`` rather than setting an
+        environment variable, because only ``cascade/config.py`` may touch the
+        process environment and a test enforces it.
+
+        A model that is genuinely absent still fails: the fallback can only
+        succeed from a populated cache, and the original error is re-raised
+        with the offline attempt's own failure attached when it is not.
+        """
+        try:
+            return factory(self.model_name, device=device)
+        except Exception as first:  # noqa: BLE001 -- re-raised unless the cache saves us
+            try:
+                return factory(self.model_name, device=device, local_files_only=True)
+            except Exception as offline:  # noqa: BLE001 -- folded into the raise below
+                raise EmbeddingUnavailable(
+                    f"could not load {self.model_name!r}: {type(first).__name__}: {first}. "
+                    f"The local cache did not satisfy it either "
+                    f"({type(offline).__name__}: {offline}). The model is pinned, so "
+                    "there is no substitution to fall back to."
+                ) from first
 
     def count_tokens(self, text: str) -> int:
         """Count tokens the way the model does.

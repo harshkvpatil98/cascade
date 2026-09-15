@@ -86,6 +86,16 @@ class TestReplicatePolicy:
         assert count == 1
         assert "already at or below" in note
 
+    def test_the_note_is_prescriptive_not_a_claim_about_what_ran(self) -> None:
+        """It is generated for all twelve cells, including ones never executed.
+
+        "ran at 30" would be a claim about a cell with no runs. What a cell
+        actually executed is measured from its stored forecasts.
+        """
+        for cell in CELLS:
+            _, note = grid_replicates(cell, policy="budget_capped", ablation_cap=30)
+            assert " ran at " not in note
+
     def test_the_note_states_which_reading_was_applied(self) -> None:
         """§10.3 warns that the ensemble contribution estimate depends on it,
         so the sentence is carried into the report verbatim."""

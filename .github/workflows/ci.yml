@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: lint · types · offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      # `embed` (torch, sentence-transformers) is deliberately not installed.
+      # It is a multi-gigabyte download needed only by the corpus and retrieval
+      # paths, which require a live Postgres with a built corpus and so cannot
+      # run here anyway. Every module that touches it imports it lazily, and a
+      # test that needs it skips rather than fails.
+      - name: Install the project
+        run: uv sync --extra dev --extra kernel
+
+      - name: ruff
+        run: uv run ruff check cascade tests
+
+      - name: black
+        run: uv run black --check cascade tests
+
+      - name: mypy (strict)
+        run: uv run mypy
+
+      # Excludes integration, leakage and network. Those need Postgres 16 with
+      # pgvector, a 1.9M-chunk corpus and a sealed registry -- state that takes
+      # hours to build and does not belong in a per-push job. `make test-all`
+      # runs them against a real environment.
+      - name: pytest (offline)
+        run: uv run pytest -m "not integration and not network and not leakage"
+
+  invariants:
+    name: invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra dev --extra kernel
+
+      # Run separately so a failure names *which* contract broke rather than
+      # arriving as one red X on a 1,300-test job. These are the checks that
+      # catch a defaulted `as_of`, a second SDK import, an unsorted iteration,
+      # a bare environment read, or a target value written into a report path.
+      - name: The nine invariants
+        run: |
+          uv run pytest -q \
+            tests/unit/test_invariants.py \
+            tests/unit/test_no_bare_environ.py \
+            tests/unit/test_ablation_factors_are_read.py \
+            tests/unit/test_eval_report.py \
+            tests/unit/test_prompt_cache_floor.py

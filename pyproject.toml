@@ -66,7 +66,12 @@ disallow_any_unimported = false
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["langfuse.*", "psycopg.*"]
+# Optional or untyped third-party packages. `sentence_transformers` and `torch`
+# live in the `embed` extra, which CI deliberately does not install -- it is a
+# multi-gigabyte download needed only by paths that also require a live
+# Postgres and a built corpus. Every module that uses them imports them lazily,
+# so type-checking must not depend on their presence.
+module = ["langfuse.*", "psycopg.*", "sentence_transformers.*", "torch.*"]
 ignore_missing_imports = true
 
 [tool.black]

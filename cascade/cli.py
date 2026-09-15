@@ -3493,7 +3493,10 @@ def _cost_snapshot(settings: Settings) -> dict[str, Any]:
 @trace_app.command("explain")
 def trace_explain(
     config: OverlayOpt = None,
-    run: Annotated[str, typer.Option("--run", help="Run id to explain.")] = "",
+    run: Annotated[
+        str,
+        typer.Option("--run", help="Run id to explain; default the first stored run."),
+    ] = "",
     factor: Annotated[
         str | None,
         typer.Option("--factor", help="Which outcome factor to trace; default the last moved."),
@@ -3508,10 +3511,23 @@ def trace_explain(
     the command failing.
     """
     from cascade.trace.provenance import explain, render
+    from cascade.trace.replay import load_replay_targets
 
     settings = _settings(config)
     if not run:
-        _fail("--run is required; `cascade simulate status` lists stored runs", EXIT_PRECONDITION)
+        # Defaulting rather than requiring: §11.2 asks for this to be
+        # demonstrable in thirty seconds, and making the demo start with a
+        # database query for a uuid is thirty seconds of its own. Ordered by
+        # run_id and taken from the front, so the default is the same run twice.
+        targets = load_replay_targets(settings, limit=1)
+        if not targets:
+            _fail(
+                "no stored runs to explain; run `cascade simulate all` or "
+                "`cascade eval grid` first",
+                EXIT_PRECONDITION,
+            )
+        run = targets[0].run_id
+        console.print(f"[dim]no --run given; explaining the first stored run {run}[/dim]")
     try:
         explanation = explain(settings, run_id=run, factor=factor)
     except LookupError as exc:

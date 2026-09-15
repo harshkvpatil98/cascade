@@ -126,7 +126,10 @@ silently.
 ## 6. Commands
 
 ```bash
-make install    # uv sync --extra dev
+make install    # uv sync --extra dev --extra kernel
+make install-full  # adds embed (torch) and analytics
+make demo       # the 90-second path: cells -> replay -> trace -> report
+make verify     # every structural gate that needs no credential
 make up         # Postgres + Langfuse, waits for health
 make migrate    # forward-only SQL migrations
 make ci         # ruff + black + mypy strict + pytest
@@ -1584,3 +1587,64 @@ Deferred, with reasons:
   The slope is measured (3.9 ms + 0.34 ms/partition) so the next session starts
   from arithmetic rather than from a guess.
 - **M9 (presentation)** → the next milestone.
+
+
+### M9 — Presentation · *repository complete; the dashboard is deferred*
+
+Shipped: `README.md` (the measured-values contract applied to the front page),
+`CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE` (MIT), `docs/adr/README.md` as an
+index of all 27 records, a GitHub Actions workflow with a gates job and a
+separate invariants job, a pull-request template carrying the gate checklist,
+and two issue templates. `make demo`, `make verify` and `make install-full`
+are new targets.
+
+**Measured acceptance values — 2 of 3 met.**
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | README with the real numbers, reproduction commands, and stated limitations | **PASS.** Every figure quoted is one this repository produced; a grep for the measurement contract's literals over `README.md` and `CHANGELOG.md` returns nothing. Six limitations stated, including the two criteria still missed. All 27 documented commands and all 11 `make` targets verified to exist; every internal link resolves | **PASS** |
+| 2 | A 90-second demo path from clean clone to one rendered trace | **PASS.** `make demo` runs registry → four ablation cells → 25-run replay → provenance chain → report artifact, entirely on the stand-in decider with no credential and no spend | **PASS** |
+| 3 | Optional read-only dashboard | **DEFERRED** — the spec marks it optional, and it would render figures for a study whose numbers do not exist. The report artifact already writes four SVGs that a browser opens directly | **DEFERRED** |
+
+CI: ruff clean, black clean, mypy strict clean (**98 files**). **1,331 tests
+pass, 1 skipped, 0 fail** (5 m 08 s).
+
+**The CI workflow was verified against a CI-equivalent environment, and it
+failed.** `uv sync --extra dev --extra kernel` deliberately omits the `embed`
+extra — torch and sentence-transformers are a multi-gigabyte download used only
+by paths that also need a live Postgres and a built corpus. Built that
+environment and ran the gates in it: **mypy failed** on
+`cascade/corpus/embed.py` for two missing imports, which would have shipped a
+red badge on the front page of a repository whose selling point is that its
+gates are real. `pyproject.toml` now lists `sentence_transformers.*` and
+`torch.*` alongside the existing `langfuse.*` and `psycopg.*` overrides, on the
+same reasoning: every module that uses them imports them lazily, so type
+checking must not depend on their presence. Re-measured in that environment:
+ruff clean, black clean, mypy clean, **1,193 passed, 1 skipped, 138 deselected
+in 21.3 s**.
+
+**Defects found and fixed at M9:**
+
+- **The quickstart did not work.** `make install` was `uv sync --extra dev`,
+  and the demo path needs `kernel` — the simulation kernel imports LangGraph,
+  so `make demo`, `cascade simulate` and `cascade trace replay` all fail
+  without it. A README whose first instruction does not work is worse than no
+  README. `make install` now includes it and `make install-full` adds the rest.
+- **`cascade trace explain` required a run id**, so the documented demo line
+  was a shell substitution around a raw `psql` call — which assumes psql is on
+  the path and configured. `--run` is now optional and defaults to the first
+  stored run, ordered by id so the default is the same run twice.
+- **The architecture diagram used a `subgraph` with forward references.**
+  Mermaid tolerates it inconsistently and GitHub is the only renderer that
+  matters here; flattened to a plain `flowchart TD`.
+
+Deferred, with reasons:
+
+- **The read-only dashboard** → optional in §14.2, and there is nothing to put
+  in it: a reliability diagram over forecasts that do not exist is a picture of
+  an empty axis. The four SVG figures the report already writes are the useful
+  subset, and they are static files a browser opens.
+- **The CI integration job** → it would need Postgres 16 with pgvector, a
+  1.9M-chunk corpus and a sealed registry, which is hours of state per push.
+  `make test-all` runs it against a real environment and the workflow says so
+  rather than quietly skipping.

@@ -180,7 +180,7 @@ def _result(**overrides):  # type: ignore[no-untyped-def]
         distinct_cutoffs=180,
         earliest_cutoff="2018-01-12T00:00:00+00:00",
         latest_cutoff="2026-07-19T00:00:00+00:00",
-        probes=40,
+        ef_search=400,
         elapsed_s=150.0,
     )
     defaults.update(overrides)

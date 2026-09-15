@@ -50,6 +50,15 @@ class Decision(BaseModel):
     tokens_in: int = Field(default=0, ge=0)
     tokens_out: int = Field(default=0, ge=0)
     latency_ms: int | None = None
+    from_model: bool = False
+    """Whether this decision came from the model at all.
+
+    The kernel counts `runs.llm_calls` off this rather than off the number of
+    decisions. They are not the same number: a stand-in decider (ADR: runs are
+    stamped `policy='heuristic'`) makes none, and §12.4's reconciliation sums
+    the column as *calls* -- so counting decisions made a heuristic run report
+    452,328 model calls costing nothing, which is a discrepancy the gate would
+    have been unable to see because both sides were zero."""
 
 
 class DecisionPolicy(Protocol):
@@ -236,6 +245,7 @@ class LLMAgents:
                 tokens_in=result.usage.input_tokens + result.usage.cache_read_input_tokens,
                 tokens_out=result.usage.output_tokens,
                 latency_ms=int(result.latency_ms),
+                from_model=True,
             )
         action, coercion = admit(payload, space)
         return Decision(
@@ -245,6 +255,7 @@ class LLMAgents:
             tokens_in=result.usage.input_tokens + result.usage.cache_read_input_tokens,
             tokens_out=result.usage.output_tokens,
             latency_ms=int(result.latency_ms),
+            from_model=True,
         )
 
     @property

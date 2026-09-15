@@ -33,6 +33,13 @@ services:
     command:
       # The vector index must live in shared_buffers for the 15 ms p95 target;
       # these are starting points, re-tuned against the M3 bench.
+      #
+      # 2GB, measured rather than reasoned. The HNSW indexes are 1,794 MB at
+      # 1.95M chunks (ADR-0026), so raising this to 4GB to hold them whole
+      # looks obviously right and is not: measured over the full 10,000-query
+      # bench it made p95 *worse*, 90.92 ms -> 120.83 ms. The container is
+      # capped at 7.75 GB, and a larger buffer pool takes that memory from the
+      # OS page cache while Postgres double-buffers through it. Left at 2GB.
       - postgres
       - -c
       - shared_buffers=2GB

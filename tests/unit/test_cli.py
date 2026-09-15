@@ -34,11 +34,12 @@ runner = CliRunner()
 
 CONSOLE_SCRIPT = Path(sys.executable).parent / "cascade"
 
-# Phases still to land. Each must refuse loudly rather than exit 0.
-# `ledger` left the stub list at M1, `corpus` at M2, `retrieval` arrived at M3,
-# `compile` at M4, `simulate` at M5, `ensemble` at M6 and `eval` + `report` at
-# M7; all of those are now sub-apps or real commands.
-DEFERRED_PHASES = ["trace"]
+# Phases still to land. Each must refuse loudly rather than exit 0. The list is
+# empty as of M8: `ledger` left it at M1, `corpus` at M2, `retrieval` at M3,
+# `compile` at M4, `simulate` at M5, `ensemble` at M6, `eval` + `report` at M7
+# and `trace` at M8. It is kept rather than deleted because the rule it
+# encodes -- a stub exits non-zero -- applies to whatever lands next.
+DEFERRED_PHASES: list[str] = []
 # `evaluate` is not a stub and not a phase: it is a deprecated alias that
 # points at `cascade eval`. It exits non-zero like a stub, so it is listed
 # separately rather than folded into either list.
@@ -52,6 +53,7 @@ IMPLEMENTED_SUBAPPS = [
     "simulate",
     "ensemble",
     "eval",
+    "trace",
 ]
 
 
@@ -129,6 +131,13 @@ def test_a_deprecated_alias_names_its_replacement(alias: str) -> None:
     result = runner.invoke(app, [alias])
     assert result.exit_code == EXIT_PRECONDITION
     assert "cascade eval" in result.output
+
+
+def test_trace_exposes_the_m8_lifecycle() -> None:
+    """explain / replay / cost are the three M8 criteria, one command each."""
+    result = runner.invoke(app, ["trace", "--help"])
+    for command in ("explain", "replay", "cost", "status"):
+        assert command in result.output
 
 
 def test_eval_exposes_the_m7_lifecycle() -> None:

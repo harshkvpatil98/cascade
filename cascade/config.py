@@ -46,6 +46,8 @@ from pydantic_settings import (
 __all__ = [
     "LLMMode",
     "Settings",
+    "child_environment",
+    "env_file_path",
     "load_settings",
     "repo_root",
 ]
@@ -165,11 +167,18 @@ class ApertureConfig(_Model):
 class RetrievalConfig(_Model):
     k_agent: int
     k_compiler: int
-    ivfflat_probes: int
     target_p95_ms: float
     partition_granularity: Literal["month", "quarter"]
-    index_max_lists: int = Field(gt=0)
-    index_rebuild_tolerance: float = Field(gt=0.0)
+    # HNSW's query-time breadth, pinned into `chronofence_search` by migration
+    # 014 the way `ivfflat.probes` was by 007. An integration test asserts the
+    # deployed function and this value agree. Build parameters, unlike
+    # IVFFlat's `lists`, do not depend on the row count -- which is what
+    # retires ADR-0012's drift class (ADR-0026). `max_k` bounds the candidate
+    # pool the function draws with a constant limit.
+    hnsw_m: int = Field(ge=2, le=100)
+    hnsw_ef_construction: int = Field(ge=4, le=1000)
+    hnsw_ef_search: int = Field(ge=1, le=1000)
+    max_k: int = Field(gt=0)
     bench_queries: int = Field(gt=0)
     bench_recall_k: int = Field(gt=0)
     bench_recall_sample: float = Field(gt=0.0, le=1.0)
@@ -514,6 +523,33 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
         else:
             out[key] = value
     return out
+
+
+def env_file_path() -> Path:
+    """Where :class:`Settings` reads its secrets from.
+
+    Exposed so a caller that needs to hand the location to a *child* process --
+    `cascade trace replay` spawns one interpreter per replay -- does not have
+    to read the environment itself. Invariant: only this module does that, and
+    the check is textual, so the way to keep it honest is to give every
+    legitimate need a function here rather than an exemption there.
+    """
+    return Path(os.environ.get("CASCADE_ENV_FILE", REPO_ROOT / ".env"))
+
+
+def child_environment(**overrides: str) -> dict[str, str]:
+    """The environment a Cascade subprocess should run with.
+
+    Inherits the parent's -- a child needs PATH, HOME and the rest -- then
+    applies ``overrides`` and pins ``CASCADE_ENV_FILE`` to the file this
+    process actually resolved. A child that re-derived that from ambient
+    environment would work from a shell and fail wherever the environment is
+    deliberately controlled, which is exactly where determinism is checked.
+    """
+    env = dict(os.environ)
+    env["CASCADE_ENV_FILE"] = str(env_file_path())
+    env.update(overrides)
+    return env
 
 
 def load_settings(overlay: str | None = None) -> Settings:

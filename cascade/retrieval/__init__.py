@@ -14,7 +14,7 @@ exhaustive oracle is not reachable, because ``cascade_sim`` is not granted it.
 from __future__ import annotations
 
 from cascade.retrieval.bench import BenchResult, run_bench
-from cascade.retrieval.index import apply_plans, measure, plan_all, target_lists
+from cascade.retrieval.index import apply_plans, drop_legacy_ivfflat, measure, plan_all
 from cascade.retrieval.metrics import (
     RecallSummary,
     histogram,
@@ -46,6 +46,7 @@ __all__ = [
     "SearchResult",
     "apply_plans",
     "build_queries",
+    "drop_legacy_ivfflat",
     "histogram",
     "measure",
     "percentile",
@@ -53,5 +54,4 @@ __all__ = [
     "recall_at_k",
     "run_bench",
     "summarise_latency",
-    "target_lists",
 ]

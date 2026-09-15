@@ -118,6 +118,18 @@ class Chronofence:
         """
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
+        max_k = self._settings.retrieval.max_k
+        if k > max_k:
+            # `chronofence_search` draws a pool of `max_k` candidates with a
+            # constant limit so the caller's k stays out of the plan (migration
+            # 014). Top-k of top-N equals top-k only while k <= N, so beyond it
+            # the function would quietly return the pool's first k rather than
+            # the corpus's -- a wrong answer that looks like a right one.
+            raise ValueError(
+                f"k={k} exceeds retrieval.max_k={max_k}, which is the candidate pool "
+                "`chronofence_search` draws. Raise max_k and the pool limit together "
+                "in a new migration, or ask for fewer chunks."
+            )
         if len(vector) != EMBEDDING_DIM:
             # Checked here because the SQL cast below carries no typmod (see
             # `_QUERY_TEMPLATE`), so Postgres would not catch a wrong-sized
@@ -177,8 +189,8 @@ class Chronofence:
         """
         return self._call("chronofence_search_exact", vector, as_of=as_of, k=k)
 
-    def probes(self) -> int:
-        """The ``ivfflat.probes`` actually pinned into the deployed function.
+    def ef_search(self) -> int:
+        """The ``hnsw.ef_search`` actually pinned into the deployed function.
 
         Read from ``pg_proc.proconfig`` rather than from config, so
         `cascade retrieval verify` compares the *deployed* value against the
@@ -193,14 +205,14 @@ class Chronofence:
             row = cur.fetchone()
         if row is None or not row[0]:
             raise RuntimeError(
-                "chronofence_search has no pinned configuration; migration 004 "
+                "chronofence_search has no pinned configuration; migration 014 "
                 "has not been applied to this database"
             )
         for entry in row[0]:
             key, _, value = str(entry).partition("=")
-            if key == "ivfflat.probes":
+            if key == "hnsw.ef_search":
                 return int(value)
         raise RuntimeError(
-            "chronofence_search does not pin ivfflat.probes; callers would silently "
-            "get pgvector's default of 1 and a recall profile nothing asserts"
+            "chronofence_search does not pin hnsw.ef_search; callers would silently "
+            "get pgvector's default of 40 and a recall profile nothing asserts"
         )

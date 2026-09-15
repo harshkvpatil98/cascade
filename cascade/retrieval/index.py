@@ -1,23 +1,31 @@
-"""IVFFlat index lifecycle for the ``chunks`` partitions (ADR-0012).
+"""HNSW index lifecycle for the ``chunks`` partitions (ADR-0012, ADR-0026).
 
-Why this is a command and not a migration is argued in ADR-0012; the short
-version is that ``lists ~= sqrt(rows_in_partition)`` is a function of measured
-data, an IVFFlat index built on an empty partition is permanently degenerate,
-and migrations run against empty databases all the time.
+Why this is a command and not a migration is argued in ADR-0012, and the
+argument survives the switch to HNSW: an index on an empty partition is built
+from nothing, migrations run against empty databases all the time, and the
+corpus is loaded by a separate resumable phase.
 
-The sizing rule is a pure function of row counts (:func:`target_lists`,
-:func:`plan_partition`) so it can be tested without a database; only
-:func:`measure` and :func:`apply_plans` touch Postgres.
+What *does* change with HNSW is the failure mode the command exists to catch.
+IVFFlat's ``lists`` is a function of the row count, so a partition that grew
+after its index was built carried a silently degraded index until someone ran
+a rebuild pass -- a drift class that interrupted M4, M5, M6 and M7 in turn.
+HNSW has no row-dependent build parameter. An index that exists stays correct
+as rows arrive, so ``rebuild`` now fires only when the *configured* build
+parameters have changed, which is an operator action rather than a background
+process.
 
-Nothing here can cause a leak. A missing or badly sized index makes retrieval
-*slower* -- at worst an exact sequential scan over the pruned partitions --
-never wider. The time predicate lives in ``chronofence_search`` and does not
-depend on any index existing.
+The planning rule is pure (:func:`plan_partition`, :func:`plan_all`) so it can
+be tested without a database; only :func:`measure` and :func:`apply_plans`
+touch Postgres.
+
+Nothing here can cause a leak. A missing index makes retrieval *slower* -- at
+worst an exact sequential scan over the pruned partitions -- never wider. The
+time predicate lives in ``chronofence_search`` and does not depend on any
+index existing.
 """
 
 from __future__ import annotations
 
-import math
 import time
 from typing import Any
 
@@ -25,17 +33,19 @@ from cascade.config import Settings
 from cascade.retrieval.schema import IndexPlan, IndexReport, PartitionIndex
 
 __all__ = [
+    "PGVECTOR_MAX_EF_CONSTRUCTION",
+    "PGVECTOR_MAX_M",
     "apply_plans",
+    "drop_legacy_ivfflat",
     "index_name_for",
     "measure",
     "plan_all",
     "plan_partition",
-    "target_lists",
 ]
 
-# pgvector's own ceiling for both `lists` and `probes`. Sizing is clamped to
-# the configured maximum, which must not exceed this.
-PGVECTOR_MAX_LISTS = 32768
+# pgvector's own ceilings for the two HNSW build parameters.
+PGVECTOR_MAX_M = 100
+PGVECTOR_MAX_EF_CONSTRUCTION = 1000
 
 
 def index_name_for(partition: str) -> str:
@@ -44,92 +54,115 @@ def index_name_for(partition: str) -> str:
     Derived rather than stored: `cascade retrieval verify` has to be able to
     say "this partition has no index" without consulting a registry that could
     itself be stale.
+
+    The name carries the access method, so an IVFFlat index left behind by a
+    pre-ADR-0026 database is not mistaken for this one -- it simply does not
+    exist under the name the command looks for, and the partition plans as
+    ``create``.
     """
-    return f"{partition}_embedding_ivfflat_idx"
+    return f"{partition}_embedding_hnsw_idx"
 
 
-def target_lists(rows: int, *, max_lists: int) -> int:
-    """``clamp(round(sqrt(rows)), 1, max_lists)`` -- spec §4.2's sizing rule.
+def _validate(m: int, ef_construction: int) -> None:
+    """Reject build parameters pgvector itself would refuse.
 
-    Rounds rather than truncates: ``int(sqrt(2400)) == 48`` against a true
-    48.99, and truncation biases every partition's list count low, which
-    widens each list and costs recall at fixed probes.
+    Checked here rather than left to Postgres so a misconfiguration fails
+    before the command starts dropping indexes, not midway through a pass.
     """
-    if rows < 0:
-        raise ValueError(f"rows cannot be negative, got {rows}")
-    if max_lists < 1:
-        raise ValueError(f"max_lists must be at least 1, got {max_lists}")
-    if rows == 0:
-        return 0
-    return max(1, min(round(math.sqrt(rows)), max_lists, PGVECTOR_MAX_LISTS))
+    if not 2 <= m <= PGVECTOR_MAX_M:
+        raise ValueError(f"hnsw m must lie in [2, {PGVECTOR_MAX_M}], got {m}")
+    if not 4 <= ef_construction <= PGVECTOR_MAX_EF_CONSTRUCTION:
+        raise ValueError(
+            f"hnsw ef_construction must lie in [4, {PGVECTOR_MAX_EF_CONSTRUCTION}], "
+            f"got {ef_construction}"
+        )
+    if ef_construction < 2 * m:
+        raise ValueError(
+            f"hnsw ef_construction ({ef_construction}) must be at least 2 * m ({2 * m}); "
+            "pgvector enforces this and a smaller value builds a degraded graph"
+        )
 
 
-def plan_partition(partition: PartitionIndex, *, max_lists: int, tolerance: float) -> IndexPlan:
+def plan_partition(partition: PartitionIndex, *, m: int, ef_construction: int) -> IndexPlan:
     """Decide what one partition needs. Pure.
 
-    An empty partition is skipped outright rather than given a ``lists = 1``
-    index: every row inserted later would land in that single list, so the
-    index would never narrow anything and would have to be rebuilt anyway.
-    """
-    target = target_lists(partition.rows, max_lists=max_lists)
+    An empty partition is skipped outright. Building on nothing produces an
+    index that is not wrong so much as pointless, and the partition will be
+    planned again -- correctly -- once it holds rows.
 
+    A partition whose index was built with different parameters is rebuilt.
+    That is the only rebuild trigger left: with IVFFlat, growth alone forced
+    one, and this command spent four milestones chasing it.
+    """
+    _validate(m, ef_construction)
     if partition.rows == 0:
         return IndexPlan(
             partition=partition.partition,
             rows=0,
-            current_lists=partition.lists,
-            target_lists=0,
+            current_m=partition.m,
+            current_ef_construction=partition.ef_construction,
+            target_m=m,
+            target_ef_construction=ef_construction,
             action="skip-empty",
-            reason="no rows; an index built here would be degenerate for every later insert",
+            reason="no rows; an index built here would describe an empty graph",
         )
 
-    if partition.index_name is None or partition.lists is None:
+    if partition.index_name is None:
         return IndexPlan(
             partition=partition.partition,
             rows=partition.rows,
-            current_lists=None,
-            target_lists=target,
+            current_m=None,
+            current_ef_construction=None,
+            target_m=m,
+            target_ef_construction=ef_construction,
             action="create",
-            reason=f"no IVFFlat index on {partition.rows:,} rows",
+            reason=f"no HNSW index on {partition.rows:,} rows",
         )
 
-    drift = abs(partition.lists - target) / target
-    if drift > tolerance:
+    if partition.m != m or partition.ef_construction != ef_construction:
         return IndexPlan(
             partition=partition.partition,
             rows=partition.rows,
-            current_lists=partition.lists,
-            target_lists=target,
+            current_m=partition.m,
+            current_ef_construction=partition.ef_construction,
+            target_m=m,
+            target_ef_construction=ef_construction,
             action="rebuild",
             reason=(
-                f"lists={partition.lists} vs target {target} on {partition.rows:,} rows "
-                f"(drift {drift:.0%} > {tolerance:.0%})"
+                f"built with m={partition.m}, ef_construction="
+                f"{partition.ef_construction}; configured m={m}, "
+                f"ef_construction={ef_construction}"
             ),
         )
 
     return IndexPlan(
         partition=partition.partition,
         rows=partition.rows,
-        current_lists=partition.lists,
-        target_lists=target,
+        current_m=partition.m,
+        current_ef_construction=partition.ef_construction,
+        target_m=m,
+        target_ef_construction=ef_construction,
         action="keep",
-        reason=f"lists={partition.lists} within {tolerance:.0%} of target {target}",
+        reason=(
+            f"m={m}, ef_construction={ef_construction} on {partition.rows:,} rows; "
+            "HNSW has no row-dependent parameter to drift"
+        ),
     )
 
 
 def plan_all(
-    partitions: list[PartitionIndex], *, max_lists: int, tolerance: float
+    partitions: list[PartitionIndex], *, m: int, ef_construction: int
 ) -> tuple[IndexPlan, ...]:
-    """Plan every partition, largest first.
+    """Plan every partition, largest first, ties broken by name (invariant 7).
 
-    Ordering is by row count descending so the partitions that dominate query
-    latency are rebuilt first: an interrupted run has then already fixed the
-    ones that matter. Ties break on name so the order is deterministic
-    (invariant 7).
+    Largest first so an interrupted pass has already indexed what dominates
+    latency -- a full build is minutes, and the partition that costs the most
+    to leave unindexed is the one with the most rows. The name tie-break is
+    what keeps the order total and reproducible.
     """
     ordered = sorted(partitions, key=lambda item: (-item.rows, item.partition))
     return tuple(
-        plan_partition(partition, max_lists=max_lists, tolerance=tolerance) for partition in ordered
+        plan_partition(partition, m=m, ef_construction=ef_construction) for partition in ordered
     )
 
 
@@ -143,18 +176,19 @@ def measure(settings: Settings) -> list[PartitionIndex]:
     """Read exact row counts and current index state per ``chunks`` partition.
 
     Counts are exact rather than ``reltuples``. An unanalysed partition reports
-    ``reltuples = -1``, and sizing an index off -1 yields ``lists = 1`` -- the
-    degenerate index this module exists to avoid. Measured on this corpus: 16
-    of 52 partitions read -1 before an ANALYZE.
+    ``reltuples = -1``, and while HNSW no longer sizes anything off the count,
+    the *skip-empty* decision still turns on it -- and skipping a partition
+    that merely looks empty is how a partition ends up permanently unindexed.
     """
     with _connect(settings) as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT partition, index_name, lists FROM chronofence_partitions ORDER BY partition"
+            "SELECT partition, index_name, m, ef_construction "
+            "FROM chronofence_partitions ORDER BY partition"
         )
         rows = cur.fetchall()
 
         out: list[PartitionIndex] = []
-        for partition, index_name, lists in rows:
+        for partition, index_name, m, ef_construction in rows:
             # Partition names come from pg_class, not from user input; quoted
             # with an identifier quote regardless, because building DDL by
             # interpolation is a habit that has to be uniform to be safe.
@@ -165,19 +199,27 @@ def measure(settings: Settings) -> list[PartitionIndex]:
                     partition=str(partition),
                     rows=int(count_row[0]) if count_row else 0,
                     index_name=str(index_name) if index_name is not None else None,
-                    lists=int(lists) if lists is not None else None,
+                    m=int(m) if m is not None else None,
+                    ef_construction=int(ef_construction) if ef_construction is not None else None,
                 )
             )
     return out
 
 
-def apply_plans(settings: Settings, plans: tuple[IndexPlan, ...]) -> IndexReport:
+def apply_plans(
+    settings: Settings, plans: tuple[IndexPlan, ...], *, maintenance_work_mem: str = "900MB"
+) -> IndexReport:
     """Execute ``plans``, one partition per transaction.
 
     Autocommit per statement so an interrupted run keeps every index it has
-    already finished rather than rolling the whole pass back. Measured on the
-    current corpus the full pass is 5.8 s for 36 partitions, but the cost
-    scales with rows and the study target is 3x the present corpus.
+    already finished rather than rolling the whole pass back.
+
+    ``maintenance_work_mem`` is raised for the session because an HNSW build
+    that does not fit in it falls back to an on-disk phase that is far slower.
+    Parallel maintenance workers are left at zero deliberately: they allocate a
+    shared-memory segment sized from ``maintenance_work_mem``, and this
+    container's ``/dev/shm`` is 1 GB, so requesting them turns a working build
+    into ``could not resize shared memory segment``.
 
     ``CREATE INDEX`` is not ``CONCURRENTLY``: this is an offline maintenance
     command on a research corpus, and the concurrent build is materially
@@ -192,6 +234,8 @@ def apply_plans(settings: Settings, plans: tuple[IndexPlan, ...]) -> IndexReport
     with psycopg.connect(settings.database_url("admin"), connect_timeout=30) as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
+            cur.execute(f"SET maintenance_work_mem = '{maintenance_work_mem}'")
+            cur.execute("SET max_parallel_maintenance_workers = 0")
             for plan in plans:
                 if plan.action == "skip-empty":
                     skipped += 1
@@ -209,8 +253,9 @@ def apply_plans(settings: Settings, plans: tuple[IndexPlan, ...]) -> IndexReport
 
                 cur.execute(
                     f'CREATE INDEX "{name}" ON "{plan.partition}" '
-                    f"USING ivfflat (embedding halfvec_l2_ops) "
-                    f"WITH (lists = {int(plan.target_lists)})"
+                    f"USING hnsw (embedding halfvec_l2_ops) "
+                    f"WITH (m = {int(plan.target_m)}, "
+                    f"ef_construction = {int(plan.target_ef_construction)})"
                 )
                 # Without fresh statistics the planner keeps costing this
                 # partition off whatever it believed before the index existed,
@@ -225,3 +270,37 @@ def apply_plans(settings: Settings, plans: tuple[IndexPlan, ...]) -> IndexReport
         skipped_empty=skipped,
         elapsed_s=time.monotonic() - started,
     )
+
+
+def drop_legacy_ivfflat(settings: Settings) -> tuple[str, ...]:
+    """Remove IVFFlat indexes left on ``chunks`` partitions. Returns their names.
+
+    Run after the HNSW pass, not before: dropping first would leave the corpus
+    unindexed for the length of the build, and a partition with two vector
+    indexes is merely wasteful while a partition with none is a sequential
+    scan. Separate from :func:`apply_plans` because it is a one-way migration
+    step, and a maintenance command that silently drops indexes it did not
+    plan is one nobody can reason about.
+    """
+    import psycopg
+
+    dropped: list[str] = []
+    with psycopg.connect(settings.database_url("admin"), connect_timeout=30) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT i.relname
+                FROM pg_index pgi
+                JOIN pg_class i ON i.oid = pgi.indexrelid
+                JOIN pg_class t ON t.oid = pgi.indrelid
+                JOIN pg_inherits inh ON inh.inhrelid = t.oid
+                JOIN pg_class parent ON parent.oid = inh.inhparent
+                WHERE parent.relname = 'chunks'
+                  AND i.relam = (SELECT oid FROM pg_am WHERE amname = 'ivfflat')
+                ORDER BY i.relname
+                """)
+            names = [str(row[0]) for row in cur.fetchall()]
+            for name in names:
+                cur.execute(f'DROP INDEX IF EXISTS "{name}"')
+                dropped.append(name)
+    return tuple(dropped)

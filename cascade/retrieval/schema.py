@@ -71,12 +71,19 @@ class SearchResult(_Frozen):
 
 
 class PartitionIndex(_Frozen):
-    """Measured state of one ``chunks`` partition and its IVFFlat index."""
+    """Measured state of one ``chunks`` partition and its HNSW index.
+
+    ``m`` and ``ef_construction`` are the index's *build* parameters. Unlike
+    IVFFlat's ``lists`` they do not depend on the row count, which is why
+    ADR-0026 retires the rebuild-on-drift pass: an HNSW index that exists stays
+    correct as rows arrive.
+    """
 
     partition: str
     rows: int
     index_name: str | None
-    lists: int | None
+    m: int | None
+    ef_construction: int | None
 
 
 IndexAction = str  # one of: "create", "rebuild", "keep", "skip-empty"
@@ -85,14 +92,16 @@ IndexAction = str  # one of: "create", "rebuild", "keep", "skip-empty"
 class IndexPlan(_Frozen):
     """What ``cascade retrieval index`` intends to do to one partition.
 
-    Separated from execution so the sizing rule is a pure function of measured
-    row counts and can be property-tested without a database.
+    Separated from execution so the planning rule is a pure function of
+    measured state and can be tested without a database.
     """
 
     partition: str
     rows: int
-    current_lists: int | None
-    target_lists: int
+    current_m: int | None
+    current_ef_construction: int | None
+    target_m: int
+    target_ef_construction: int
     action: IndexAction
     reason: str
 

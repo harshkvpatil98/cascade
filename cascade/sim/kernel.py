@@ -534,7 +534,11 @@ class Loom:
             ctx.memories[actor_id] = memory.remember(
                 observation, action=decision.action, window=window
             )
-            ctx.llm_calls += 1
+            # Counted off `from_model`, not off the number of decisions: a
+            # stand-in decider makes none, and §12.4 sums this column as
+            # *calls*. A heuristic run reporting one call per decision made the
+            # cost reconciliation compare zero against zero and pass.
+            ctx.llm_calls += int(decision.from_model)
             ctx.cache_hits += int(decision.cache_hit)
             ctx.tokens_in += decision.tokens_in
             ctx.tokens_out += decision.tokens_out

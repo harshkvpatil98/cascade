@@ -98,27 +98,43 @@ def test_function_pins_its_search_path(live_settings: Settings, name: str) -> No
 def test_deployed_probes_match_the_configured_value(live_settings: Settings) -> None:
     """Config and schema cannot drift apart silently.
 
-    `probes` lives in two places by necessity -- pinned into the function so a
-    caller cannot forget it, and in config so the bench can report it. This is
-    the assertion that keeps them equal, and it points at the fix: migrations
-    are forward-only, so a change means a new migration, not an edit.
+    `ef_search` lives in two places by necessity -- pinned into the function so
+    a caller cannot forget it, and in config so the bench can report it. This
+    is the assertion that keeps them equal, and it points at the fix:
+    migrations are forward-only, so a change means a new migration, not an edit.
     """
     from cascade.retrieval.search import Chronofence
 
     with Chronofence(live_settings, role="admin") as fence:
-        deployed = fence.probes()
-    assert deployed == live_settings.retrieval.ivfflat_probes, (
-        f"chronofence_search pins ivfflat.probes={deployed} but "
-        f"retrieval.ivfflat_probes is {live_settings.retrieval.ivfflat_probes}; "
+        deployed = fence.ef_search()
+    assert deployed == live_settings.retrieval.hnsw_ef_search, (
+        f"chronofence_search pins hnsw.ef_search={deployed} but "
+        f"retrieval.hnsw_ef_search is {live_settings.retrieval.hnsw_ef_search}; "
         "add a migration rather than editing an applied one"
     )
 
 
-def test_the_exact_oracle_is_exhaustive(live_settings: Settings) -> None:
-    """It is the ground truth for recall, so it must visit every list.
+def test_ef_search_is_at_least_the_largest_k_the_study_asks_for(
+    live_settings: Settings,
+) -> None:
+    """`ef_search` bounds how many candidates one partition can contribute.
 
-    32768 is pgvector's maximum for both `probes` and `lists`, so probes can
-    never be smaller than a partition's list count.
+    A scenario whose cutoff admits few partitions would otherwise be unable to
+    fill a `k_compiler`-sized request from them, and the shortfall would look
+    like a corpus with nothing to say rather than an index asked for too little.
+    """
+    retrieval = live_settings.retrieval
+    assert retrieval.hnsw_ef_search >= max(retrieval.k_agent, retrieval.k_compiler)
+
+
+def test_the_exact_oracle_is_exhaustive(live_settings: Settings) -> None:
+    """It is the ground truth for recall, so it must not use an index at all.
+
+    Under IVFFlat the oracle was made exhaustive by probing every list. HNSW
+    has no equivalent -- an HNSW scan is approximate at any `ef_search` -- so
+    migration 014 turns index scans off inside the oracle instead. That is
+    stronger: the oracle now cannot silently inherit the approximate path's
+    parameters, because it cannot use the approximate path.
     """
     rows = query(
         live_settings,
@@ -126,7 +142,11 @@ def test_the_exact_oracle_is_exhaustive(live_settings: Settings) -> None:
         "WHERE n.nspname = 'public' AND proname = 'chronofence_search_exact'",
     )
     config = rows[0][0] or []
-    assert "ivfflat.probes=32768" in config
+    assert "enable_indexscan=off" in config
+    assert "enable_bitmapscan=off" in config
+    assert not any(entry.startswith("hnsw.") for entry in config), (
+        "the recall oracle must not pin an approximate-search parameter; " f"found {config}"
+    )
 
 
 def test_as_of_has_no_default_in_the_signature(live_settings: Settings) -> None:
@@ -190,8 +210,8 @@ def test_every_non_empty_partition_has_a_correctly_sized_index(
     retrieval = live_settings.retrieval
     plans = plan_all(
         measure(live_settings),
-        max_lists=retrieval.index_max_lists,
-        tolerance=retrieval.index_rebuild_tolerance,
+        m=retrieval.hnsw_m,
+        ef_construction=retrieval.hnsw_ef_construction,
     )
     stale = [plan for plan in plans if plan.action in {"create", "rebuild"}]
     assert stale == [], (
@@ -202,7 +222,7 @@ def test_every_non_empty_partition_has_a_correctly_sized_index(
 
 
 def test_empty_partitions_carry_no_index(live_settings: Settings) -> None:
-    """An IVFFlat index built on no rows is permanently degenerate (ADR-0012)."""
+    """An index built on no rows describes an empty graph (ADR-0012)."""
     empty_with_index = [
         partition
         for partition in measure(live_settings)
@@ -225,7 +245,25 @@ def test_indexes_use_the_expected_name_and_operator_class(live_settings: Setting
 
     rows = query(
         live_settings,
-        "SELECT count(*) FROM pg_indexes WHERE indexname LIKE '%%_embedding_ivfflat_idx' "
+        "SELECT count(*) FROM pg_indexes WHERE indexname LIKE '%%_embedding_hnsw_idx' "
         "AND indexdef NOT LIKE '%%halfvec_l2_ops%%'",
     )
-    assert rows[0][0] == 0, "an IVFFlat index uses an unexpected operator class"
+    assert rows[0][0] == 0, "an HNSW index uses an unexpected operator class"
+
+
+def test_no_ivfflat_index_survives_on_the_chunks_partitions(
+    live_settings: Settings,
+) -> None:
+    """ADR-0026 replaced them. One left behind is not wrong, merely wasteful --
+    and a partition carrying both is one whose plan nobody can predict."""
+    rows = query(
+        live_settings,
+        "SELECT count(*) FROM pg_index pgi "
+        "JOIN pg_class i ON i.oid = pgi.indexrelid "
+        "JOIN pg_class t ON t.oid = pgi.indrelid "
+        "JOIN pg_inherits inh ON inh.inhrelid = t.oid "
+        "JOIN pg_class parent ON parent.oid = inh.inhparent "
+        "WHERE parent.relname = 'chunks' "
+        "AND i.relam = (SELECT oid FROM pg_am WHERE amname = 'ivfflat')",
+    )
+    assert rows[0][0] == 0, "run `cascade retrieval index --drop-legacy`"

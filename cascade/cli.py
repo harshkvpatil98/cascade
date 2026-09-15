@@ -22,13 +22,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from cascade.config import Settings, load_settings, repo_root
+from cascade.config import Settings, env_file_path, load_settings, repo_root
 from cascade.llm.types import BudgetExceeded, CacheMiss, PromptTooShortToCache
 
 if TYPE_CHECKING:  # pragma: no cover -- types only, never imported at startup
     from cascade.eval.schema import MetricSet, ScoredForecast
     from cascade.eval.store import FrozenSplit
 
+from cascade.trace.replay import CHILD_HASH_SEED
 from cascade.version import (
     EXIT_BUDGET_BREACH,
     EXIT_CACHE_MISS,
@@ -80,6 +81,11 @@ eval_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(eval_app, name="eval")
+trace_app = typer.Typer(
+    help="Strata: replay determinism, provenance chains and the cost ledger (M8).",
+    no_args_is_help=True,
+)
+app.add_typer(trace_app, name="trace")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -285,12 +291,6 @@ def evaluate(config: OverlayOpt = None) -> None:
         "`cascade eval significance`, or `cascade report`."
     )
     raise typer.Exit(EXIT_PRECONDITION)
-
-
-@app.command()
-def trace(config: OverlayOpt = None) -> None:
-    """Walk the provenance chain from an outcome to its root cause (M8)."""
-    _not_yet("trace", "M8")
 
 
 # ---------------------------------------------------------------------------
@@ -824,8 +824,8 @@ def _print_index_report(report: Any) -> None:
         table.add_row(
             plan.partition,
             f"{plan.rows:,}",
-            "-" if plan.current_lists is None else str(plan.current_lists),
-            "-" if plan.target_lists == 0 else str(plan.target_lists),
+            "-" if plan.current_m is None else f"{plan.current_m}/{plan.current_ef_construction}",
+            f"{plan.target_m}/{plan.target_ef_construction}",
             f"[{style}]{plan.action}[/{style}]" if style else plan.action,
             plan.reason,
         )
@@ -844,14 +844,23 @@ def retrieval_index(
         bool,
         typer.Option("--dry-run", help="Print the plan without touching any index."),
     ] = False,
+    drop_legacy: Annotated[
+        bool,
+        typer.Option("--drop-legacy", help="Drop IVFFlat indexes after the HNSW pass."),
+    ] = False,
 ) -> None:
-    """Create or rebuild one IVFFlat index per non-empty chunks partition.
+    """Create one HNSW index per non-empty chunks partition (ADR-0012, ADR-0026).
 
-    Sized `lists = clamp(round(sqrt(rows)), 1, index_max_lists)` from exact
-    row counts (ADR-0012). Idempotent: a second run keeps everything already
-    within tolerance.
+    Idempotent, and -- unlike the IVFFlat pass this replaces -- a partition
+    that has merely grown needs nothing. HNSW has no row-dependent build
+    parameter, so a rebuild fires only when `hnsw_m` or `hnsw_ef_construction`
+    changes.
+
+    `--drop-legacy` removes IVFFlat indexes left on the partitions afterwards.
+    It runs last on purpose: dropping first would leave the corpus unindexed
+    for the length of the build.
     """
-    from cascade.retrieval.index import apply_plans, measure, plan_all
+    from cascade.retrieval.index import apply_plans, drop_legacy_ivfflat, measure, plan_all
     from cascade.retrieval.schema import IndexReport
 
     settings = _settings(config)
@@ -860,8 +869,8 @@ def retrieval_index(
     partitions = measure(settings)
     plans = plan_all(
         partitions,
-        max_lists=retrieval.index_max_lists,
-        tolerance=retrieval.index_rebuild_tolerance,
+        m=retrieval.hnsw_m,
+        ef_construction=retrieval.hnsw_ef_construction,
     )
 
     if dry_run:
@@ -879,6 +888,16 @@ def retrieval_index(
         return
 
     _print_index_report(apply_plans(settings, plans))
+    if drop_legacy:
+        dropped = drop_legacy_ivfflat(settings)
+        console.print(
+            f"dropped [bold]{len(dropped)}[/bold] legacy IVFFlat index(es)"
+            + (
+                f": {', '.join(dropped[:3])}..."
+                if len(dropped) > 3
+                else (f": {', '.join(dropped)}" if dropped else "")
+            )
+        )
 
 
 def _print_bench_result(result: Any, settings: Settings) -> None:
@@ -895,7 +914,7 @@ def _print_bench_result(result: Any, settings: Settings) -> None:
         table.add_row(name, measured, required, "[green]OK[/green]" if ok else "[red]NO[/red]")
 
     row("queries", f"{result.queries:,}", "-", True)
-    row("ivfflat probes", str(result.probes), str(target.ivfflat_probes), True)
+    row("hnsw ef_search", str(result.ef_search), str(target.hnsw_ef_search), True)
     row("p50", f"{result.latency.p50:.2f} ms", "-", True)
     row(
         "p95",
@@ -984,19 +1003,19 @@ def retrieval_verify(config: OverlayOpt = None) -> None:
     failures: list[str] = []
 
     with Chronofence(settings, role="admin") as fence:
-        deployed = fence.probes()
-    if deployed != retrieval.ivfflat_probes:
+        deployed = fence.ef_search()
+    if deployed != retrieval.hnsw_ef_search:
         failures.append(
-            f"chronofence_search pins ivfflat.probes={deployed} but config says "
-            f"{retrieval.ivfflat_probes}; migrations are forward-only, so add a new "
+            f"chronofence_search pins hnsw.ef_search={deployed} but config says "
+            f"{retrieval.hnsw_ef_search}; migrations are forward-only, so add a new "
             "migration rather than editing 004"
         )
 
     partitions = measure(settings)
     plans = plan_all(
         partitions,
-        max_lists=retrieval.index_max_lists,
-        tolerance=retrieval.index_rebuild_tolerance,
+        m=retrieval.hnsw_m,
+        ef_construction=retrieval.hnsw_ef_construction,
     )
     stale = [plan for plan in plans if plan.action in {"create", "rebuild"}]
 
@@ -1010,7 +1029,7 @@ def retrieval_verify(config: OverlayOpt = None) -> None:
 
     indexed = sum(1 for plan in plans if plan.action == "keep")
     non_empty = sum(1 for plan in plans if plan.rows > 0)
-    row("ivfflat probes pinned", str(deployed), deployed == retrieval.ivfflat_probes)
+    row("hnsw ef_search pinned", str(deployed), deployed == retrieval.hnsw_ef_search)
     row("non-empty partitions", str(non_empty), True)
     row("correctly sized indexes", f"{indexed}/{non_empty}", not stale)
 
@@ -3464,6 +3483,248 @@ def _cost_snapshot(settings: Settings) -> dict[str, Any]:
                     "error": f"{type(exc).__name__}: {exc}"
                 }
     return ledger
+
+
+# ---------------------------------------------------------------------------
+# trace: Strata -- determinism, provenance and the cost ledger (M8, spec §8, §11)
+# ---------------------------------------------------------------------------
+
+
+@trace_app.command("explain")
+def trace_explain(
+    config: OverlayOpt = None,
+    run: Annotated[str, typer.Option("--run", help="Run id to explain.")] = "",
+    factor: Annotated[
+        str | None,
+        typer.Option("--factor", help="Which outcome factor to trace; default the last moved."),
+    ] = None,
+) -> None:
+    """Walk one run's log from its outcome back to an exogenous shock (§11.2).
+
+    "Every outcome traces back to the exact agent decision that triggered it"
+    is the study's strongest claim, and §11.2 asks for it to be demonstrable in
+    thirty seconds rather than described. Exits **3** when the chain does not
+    reach a root cause, because an incomplete chain is the claim failing, not
+    the command failing.
+    """
+    from cascade.trace.provenance import explain, render
+
+    settings = _settings(config)
+    if not run:
+        _fail("--run is required; `cascade simulate status` lists stored runs", EXIT_PRECONDITION)
+    try:
+        explanation = explain(settings, run_id=run, factor=factor)
+    except LookupError as exc:
+        _fail(str(exc), EXIT_PRECONDITION)
+
+    header = Table(title=f"Run {explanation.run_id}")
+    header.add_column("Field", style="cyan")
+    header.add_column("Value", overflow="fold")
+    header.add_row("scenario", explanation.scenario_id)
+    header.add_row("config", explanation.config_id)
+    header.add_row("replicate", str(explanation.replicate))
+    header.add_row("outcome score", f"{explanation.outcome_score:.4f}")
+    header.add_row("steps / termination", f"{explanation.steps_run} / {explanation.termination}")
+    console.print(header)
+
+    for line in render(explanation):
+        console.print(line)
+
+    root = explanation.root
+    if root is None or explanation.truncated:
+        reason = (
+            "the walk hit the depth bound with antecedents left"
+            if explanation.truncated
+            else "no exogenous movement was recorded for this run"
+        )
+        _fail(f"chain does not reach a root cause: {reason}", EXIT_PRECONDITION)
+    console.print(
+        f"[bold green]complete chain: {len(explanation.links)} decision(s) "
+        f"to an exogenous shock at step {root.step}[/bold green]"
+    )
+
+
+@trace_app.command("replay")
+def trace_replay(
+    config: OverlayOpt = None,
+    runs: Annotated[int, typer.Option("--runs", help="How many stored runs to replay.")] = 25,
+    config_id: Annotated[
+        str | None, typer.Option("--config-id", help="Restrict to one configuration.")
+    ] = None,
+    workers: Annotated[int, typer.Option("--workers", help="Concurrent child processes.")] = 4,
+) -> None:
+    """Re-run stored runs in fresh processes and compare the event-log hashes.
+
+    M8's first criterion. Each replay runs in its own interpreter under a
+    different `PYTHONHASHSEED`: within one process a dependency on dict
+    insertion order or on `id()` is perfectly stable, and diverges only across
+    one. Nothing is written -- a verification pass that inserted its own copy
+    of the log would make the M6 event count drift every time someone checked.
+
+    Exits **3** on any divergence, naming the first step whose state hash
+    differs (§8.4: the bisect names the first divergent field, and the fix is
+    the source, never a tolerance).
+    """
+    from cascade.trace.replay import load_replay_targets, verify_replays
+
+    settings = _settings(config)
+    targets = load_replay_targets(settings, limit=runs, config_id=config_id)
+    if not targets:
+        _fail(
+            "no stored runs to replay; run `cascade simulate all` first"
+            + (f" (config {config_id})" if config_id else ""),
+            EXIT_PRECONDITION,
+        )
+
+    report = verify_replays(targets, workers=workers, env_file=str(env_file_path()))
+
+    table = Table(title="Replay determinism (spec §8.4, M8)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Criterion", justify="right")
+    table.add_row("runs replayed", f"{report.attempted:,}", f"{runs:,}")
+    table.add_row(
+        "byte-identical event-log hash",
+        f"{report.matched:,}/{report.attempted:,}",
+        f"{report.attempted:,}/{report.attempted:,}",
+    )
+    table.add_row("child hash seed", CHILD_HASH_SEED, "differs from the parent's")
+    table.add_row("elapsed", f"{report.elapsed_s:.1f}s", "-")
+    console.print(table)
+
+    if report.diverged:
+        detail = Table(title="Divergences")
+        detail.add_column("run", style="cyan", overflow="fold")
+        detail.add_column("first divergent step", justify="right")
+        detail.add_column("stored state hash")
+        detail.add_column("replayed state hash")
+        detail.add_column("error", overflow="fold")
+        for outcome in report.diverged:
+            detail.add_row(
+                outcome.run_id,
+                "-" if outcome.first_divergent_step is None else str(outcome.first_divergent_step),
+                (outcome.expected_state_hash or "-")[:16],
+                (outcome.actual_state_hash or "-")[:16],
+                outcome.error or "",
+            )
+        console.print(detail)
+        _fail(
+            f"{len(report.diverged)} of {report.attempted} run(s) did not replay identically; "
+            "fix the source of the nondeterminism, never add a tolerance",
+            EXIT_PRECONDITION,
+        )
+    console.print("[bold green]every replayed run reproduced its event-log hash[/bold green]")
+
+
+@trace_app.command("cost")
+def trace_cost(
+    config: OverlayOpt = None,
+    config_id: Annotated[
+        str | None, typer.Option("--config-id", help="Restrict to one configuration.")
+    ] = None,
+) -> None:
+    """Reconcile the run ledger against Langfuse (spec §12.4, M8).
+
+    Two independent records of the same spend: the meter prices every call from
+    the pinned table and writes the total to `runs.cost_usd`; the tracer emits
+    one Langfuse generation per call carrying the same cost. §12.4 blocks the
+    report on a discrepancy above 2%, so this exits **3** there.
+
+    An *unreachable* Langfuse is reported as unreconciled rather than as a
+    discrepancy: `tracing.py` is allowed to degrade to a no-op because
+    observability must never fail a run, and "we could not check" is not
+    "we checked".
+    """
+    from cascade.trace.ledger import reconcile
+
+    settings = _settings(config)
+    result = reconcile(settings, config_id=config_id)
+
+    table = Table(title="Cost ledger reconciliation (spec §12.4)")
+    table.add_column("Source", style="cyan")
+    table.add_column("USD", justify="right")
+    table.add_column("calls", justify="right")
+    table.add_column("tokens in / out", justify="right")
+    table.add_column("detail", overflow="fold")
+    table.add_row(
+        result.local.source,
+        f"${result.local.total_usd:.6f}",
+        f"{result.local.calls:,}",
+        f"{result.local.input_tokens:,} / {result.local.output_tokens:,}",
+        result.local.detail,
+    )
+    if result.remote is None:
+        table.add_row("langfuse", "not measured", "-", "-", "unreachable or not configured")
+    else:
+        table.add_row(
+            result.remote.source,
+            f"${result.remote.total_usd:.6f}",
+            f"{result.remote.calls:,}",
+            f"{result.remote.input_tokens:,} / {result.remote.output_tokens:,}",
+            result.remote.detail,
+        )
+    console.print(table)
+
+    relative = result.relative_difference
+    if result.vacuous:
+        console.print("[yellow]no spend recorded on either side[/yellow]")
+    console.print(
+        "difference: "
+        + (
+            "[yellow]not measured[/yellow]"
+            if relative is None
+            else f"[bold]{relative:.4%}[/bold] against a {result.tolerance:.0%} tolerance"
+        )
+    )
+
+    if result.remote is None:
+        _fail(
+            "Langfuse reported no total, so the ledger is unreconciled. §12.4 makes "
+            "reconciliation a gate on the report; bring Langfuse up (`make up`) and "
+            "re-run, or record the phase as unreconciled in the report.",
+            EXIT_PRECONDITION,
+        )
+    if result.vacuous:
+        _fail(
+            "neither record holds any spend, so there is nothing to reconcile. Zero "
+            "agrees with zero to 0.0000% and passing on that would be a gate that "
+            "cannot fail -- run a phase that reaches the model first.",
+            EXIT_PRECONDITION,
+        )
+    if not result.within_tolerance:
+        _fail(
+            f"ledger and Langfuse differ by {relative:.4%}, above the "
+            f"{result.tolerance:.0%} tolerance; §12.4 calls that a bug in the meter",
+            EXIT_PRECONDITION,
+        )
+    console.print("[bold green]cost ledger reconciles within tolerance[/bold green]")
+
+
+@trace_app.command("status")
+def trace_status(config: OverlayOpt = None) -> None:
+    """What is replayable and traceable right now."""
+    from cascade.trace.store import run_stats
+
+    settings = _settings(config)
+    stats = run_stats(settings)
+
+    table = Table(title="Provenance (M8, spec §8, §11)")
+    table.add_column("Quantity", style="cyan")
+    table.add_column("Measured", justify="right")
+    table.add_column("Criterion", justify="right")
+    table.add_row("stored runs", f"{stats.runs:,}", "36,000")
+    table.add_row("logged decision events", f"{stats.events:,}", f"{TARGET_EVENTS:,} +/- 5%")
+    table.add_row(
+        "distinct event-log hashes",
+        f"{stats.distinct_event_hashes:,}",
+        f"{stats.runs:,} (one per run)",
+    )
+    table.add_row("distinct configs", ", ".join(stats.configs) or "-", "-")
+    console.print(table)
+    console.print(
+        "[dim]`cascade trace replay --runs 25` checks the M8 hash criterion; "
+        "`cascade trace explain --run <id>` walks one outcome to its root cause.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------

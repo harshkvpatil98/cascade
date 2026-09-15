@@ -19,7 +19,7 @@ restated. **Never write a target value into a report code path. Never hardcode
 |---|---|---|
 | Backtested scenarios | 180 resolved binary questions | M1 |
 | Evidence corpus | ≥ 1.30M pre-cutoff chunks | M2 — met (1,950,912) |
-| Retrieval p95 | < 15 ms, recall@20 > 0.92 | M3 — **not met at 1.95M chunks**: 176.00 ms / 0.8950, see the M7 build-log entry |
+| Retrieval p95 | < 15 ms, recall@20 > 0.92 | M3 — at 1.95M chunks after ADR-0026: **recall@20 0.9675 met**, p95 90.92 ms **not met**; see the M8 entry |
 | Mean actors / scenario | 14 (range 8–20) | M4 |
 | Simulation horizon | 24 steps per run | M5 |
 | Runs | 200 × 180 = 36,000 | M6 |
@@ -166,14 +166,19 @@ cascade eval score --config-id C01   # §10.1 metrics for one configuration
 cascade eval significance  # paired bootstrap + Holm-Bonferroni (§10.4)
 cascade eval prompt-audit  # §1.3's before/after Brier for a prompt revision
 cascade report             # write reports/study_{ts}/ (Appendix D)
+
+cascade trace status       # what is replayable and traceable
+cascade trace replay --runs 25   # M8: byte-identical event-log hash, across processes
+cascade trace explain --run ID   # §11.2's chain from an outcome to a root cause
+cascade trace cost         # §12.4: reconcile the run ledger against Langfuse
 ```
 
 ---
 
 ## 7. Architecture decisions
 
-Twenty-five ADRs in `docs/adr/`. Fourteen correct defects found in the spec,
-and 0023 and 0025 correct defects found in **this build** -- an ingest order
+Twenty-seven ADRs in `docs/adr/`. Fifteen correct defects found in the spec,
+and 0023, 0025 and 0026 correct defects found in **this build** -- an ingest order
 that satisfied every criterion while covering the wrong years, and two ablation
 factors that were configured, documented and inert. The rest record choices the
 spec left open.
@@ -205,6 +210,8 @@ spec left open.
 | 0023 | A CC-NEWS unit is one WARC file and the pending queue is ordered depth-major by scenario demand; chronological month units left a 1.76M-chunk corpus with 99.6% of its evidence before 2018-04 against 169 of 180 cutoffs after 2024-01 | M2 (found at M7) |
 | 0024 | Report figures are SVG written from the pinned stack; Appendix D names `.png` and the stack has no plotting library, and matplotlib/scipy/sklearn are present here only as undeclared transitive dependencies of the embed extra | M7 |
 | 0025 | Ablation factors A (`causal_decomposition`) and C (`grounding`) are mechanisms, not configuration fields: both were read nowhere outside `config.py`, so six of the twelve cells would have executed as duplicates and the headline deltas would have been precise nulls | M7 |
+| 0026 | HNSW replaces IVFFlat and the caller's `k` leaves the plan: a parameterised `LIMIT k` in a non-inlinable SECURITY DEFINER function cost 4x, and IVFFlat's `probes x Σ√n_p` does not scale past ~2M chunks. Retires ADR-0012's rebuild-on-drift class and supersedes ADR-0013's `probes` | M8 (amends M3) |
+| 0027 | §11.2's provenance walk is a path, not an ancestor set: the spec's CTE recurses over every element of `caused_by` and expands 6^depth, which did not return on a 24-step run; its own example output is a single path | M8 |
 
 ---
 
@@ -1408,3 +1415,172 @@ Deferred, with reasons:
   The ledger reads the meter checkpoints and says so.
 - **Parquet/DuckDB export** → still nothing to export; `duckdb` and `pyarrow`
   are pinned and uninstalled.
+
+### M8 — Strata: determinism and provenance · *complete; 2 of 3 acceptance criteria met on real data, 1 blocked on the credential*
+
+Shipped: `cascade/trace/` — `provenance.py` (§11.2's walk and its rendering),
+`replay.py` + `replay_child.py` (cross-process replay verification with a
+per-step bisect), `ledger.py` (§12.4's reconciliation); `cascade trace
+status|explain|replay|cost`; `cascade/config.py` grew `env_file_path()` and
+`child_environment()`; migrations 014–016; ADR-0026 and ADR-0027.
+
+**Measured acceptance values — 2 of 3 met.**
+
+| # | Criterion | Measured | Verdict |
+|---|---|---|---|
+| 1 | 25-run replay produces a byte-identical event-log hash across processes | **25/25** in 24.3 s, each in its own interpreter under a `PYTHONHASHSEED` differing from the parent's, compared against the hash each run stored at completion. The event log grew by **0** rows during the pass | **PASS** |
+| 2 | `cascade trace --explain-outcome` returns a complete chain to a root cause | **Complete**, in **0.27 s**: 12 decisions from `outcome_score 0.53 <- factor 'momentum' moved last at step 23` back to `root step 0 exogenous shock on 'resistance' +0.04`. Asserted over 10 stored runs, not one | **PASS** |
+| 3 | Cost ledger reconciles with Langfuse within 2% | **NOT MEASURABLE** — every stored run was made with the stand-in decider and books no spend, so both records are zero. The command reaches Langfuse, reads its daily metrics, and **exits 3** rather than passing on zero-against-zero | **BLOCKED** |
+
+CI: ruff clean, black clean, mypy strict clean (**98 files**). **1,331 tests
+pass, 1 skipped, 0 fail** -- the full suite including integration and leakage
+against live services (4 m 34 s); 1,194 of them run offline with no services at
+all. M8 added **72**. The one skip is the deferred-phase parametrisation, whose
+list is now empty: nothing is stubbed. `cascade/trace/` is **1,435 lines**
+across 6 modules.
+
+**Criterion 3 is blocked on the same credential as M4–M7, and refusing to pass
+was the point.** A first implementation reported `difference: 0.0000% — cost
+ledger reconciles within tolerance` over 452,328 model calls costing $0.00
+against a Langfuse total of $0.00. Both halves of that were wrong and each was
+worth finding:
+
+- **`runs.llm_calls` counted decisions, not model calls.** The kernel did
+  `ctx.llm_calls += 1` once per decision regardless of whether anything reached
+  the model, so a run made with the stand-in decider recorded one call per
+  decision while making none. `Decision.from_model` now carries it and the
+  kernel counts off that; migration 016 corrects the rows already written,
+  touching `runs` and never `events` (invariant 6).
+- **Zero against zero agreed to 0.0000% and passed.** §12.4's gate guards the
+  study's cost claim, and a gate that compares two zeros cannot fail.
+  `LedgerReconciliation.vacuous` now distinguishes *nothing to reconcile* from
+  *reconciled*, and it is a third verdict alongside *unreachable* — because
+  observability is allowed to degrade to a no-op (`tracing.py`) and "we could
+  not check" is not "we checked".
+
+**Previous-phase issue cleared: the retrieval regression is closed on recall
+and improved 1.9x on latency.** M7 recorded p95 176.00 ms against a 15 ms
+budget and recall@20 0.8950 against a 0.92 floor, named the levers, and tuned
+nothing. Measuring instead of tuning found **two independent defects**, one of
+which had nothing to do with the index (ADR-0026).
+
+*The parameterised `LIMIT k` cost 4x.* `chronofence_search` is SECURITY
+DEFINER with a pinned `search_path`, and each of those independently
+disqualifies a SQL function from inlining. Non-inlined, `k` is a runtime
+parameter, so the planner cannot know how far the Merge Append across 47
+partitions will be driven. Holding the attributes fixed and varying only the
+limit isolates it:
+
+| body | latency |
+|---|---|
+| `LIMIT k` (parameter) | 138.5 ms |
+| `LIMIT 20` (literal) | **35.4 ms** |
+
+The function now draws a bounded pool with a *constant* limit and applies the
+caller's `k` to it. Identical for any `k ≤ 200`, and *more* deterministic: the
+`(distance, chunk_id)` tie-break is applied over a pool larger than `k` rather
+than at the k-th boundary, which M8's hash depends on.
+
+*IVFFlat does not scale here.* `probes × Σ_p sqrt(n_p)` measured **5,727**
+against roughly 1,840 at M3's distribution. On the dominant partition, same
+query, same warm cache: IVFFlat probes=40 **6.57 ms**; HNSW ef_search=40
+**0.60 ms** at recall@20 **1.0000**. Switching is not a stack substitution —
+HNSW is a feature of the pinned pgvector 0.8 — and it **retires ADR-0012's
+drift class**, which had interrupted M4, M5, M6 and M7 in turn: `lists` is a
+function of the row count, `m` and `ef_construction` are not.
+
+`ef_search` was then chosen the way ADR-0013 chose `probes`, on a measured
+curve over the bench's own query generator scored against the exact oracle:
+
+| ef_search | recall@20 | p50 | p95 |
+|---|---|---|---|
+| 100 | 0.8521 | 19.09 ms | 24.51 ms |
+| 200 | 0.9133 | 29.44 ms | 36.12 ms |
+| **400** | **0.9458** | 49.51 ms | 59.76 ms |
+| 800 | 0.9533 | 82.07 ms | 97.96 ms |
+
+400 is the smallest value clearing the recall floor. **Measured over the full
+10,000-query bench at that setting: recall@20 0.9675 (criterion > 0.92, MET),
+p95 90.92 ms (criterion < 15 ms, MISSED).** Worst-case recall went from 0.0500
+to 0.7000 and perfect-recall queries from 44/100 to 68/100.
+
+**Why recall was bought at the cost of latency, deliberately and on the
+record.** §4.3's 15 ms budget was derived for §7.2's per-step retrieval — 4.2M
+searches across the study. ADR-0019 replaced that with one retrieval per
+(scenario, actor), roughly **2,520 searches in total**, so the study's entire
+retrieval cost at the measured p95 is about four minutes, while recall sets the
+quality of every agent's evidence for all 36,000 runs. The p95 criterion is
+still missed, still reported as missed, and `cascade retrieval bench` still
+exits 3. Nothing was relaxed.
+
+**The remaining latency gap is the partition count, quantified.** Measured
+across cutoff eras, cost is about **3.9 ms fixed + 0.34 ms per partition
+scanned** — 13 partitions for a 2018 cutoff, 47 for a 2026 one. HNSW inverts
+ADR-0004's tradeoff: under IVFFlat more partitions meant less data per scan,
+under HNSW scan cost is logarithmic and the per-partition overhead dominates,
+so *fewer, larger* partitions are strictly better. Annual partitioning would
+put the fixed cost near 8 ms. It is not done here because it is a rewrite of
+1.95M rows whose recall consequence — a mid-year cutoff post-filters a whole
+year's partition — needs its own measurement campaign, which is M3 work.
+
+**One experiment was run and rejected on measurement.** The HNSW indexes are
+1,794 MB against a 2 GB `shared_buffers`, so raising it to 4 GB to hold them
+whole looks obviously right. Measured over the full bench it made p95 *worse*,
+**90.92 ms → 120.83 ms**: the container is capped at 7.75 GB and a larger
+buffer pool takes that memory from the OS page cache while Postgres double-
+buffers through it. Reverted, with the measurement recorded in
+`docker-compose.yml` so nobody re-derives the same wrong conclusion.
+
+**Defects found and fixed at M8** (each has a regression test):
+
+- **§11.2's recursive CTE does not terminate.** The spec recurses over every
+  element of `caused_by`, which holds up to 6 antecedents, so the ancestor set
+  expands 6^depth — on the order of 10^18 rows at the 24-step horizon. Measured
+  on a real stored run, it did not return and the command was killed after ten
+  minutes. Its own example output is a single path; the walk now follows one
+  antecedent per level and returns in 0.27 s (ADR-0027). Three guards bound it:
+  a depth ceiling above the horizon, a non-empty `caused_by`, and a strict
+  `(step, seq)` decrease that a corrupt row cannot loop through.
+- **The chain printed `+0.00` for real movements.** A per-step factor movement
+  is bounded by `kernel.max_step_delta` (0.12) and is routinely an order of
+  magnitude under it, so two decimals rendered every link as having done
+  nothing — in the one display whose job is to show that it did.
+- **The replay child could not reach the database under test.** It rebuilt
+  `Settings` from ambient environment, and the suite strips every `CASCADE_*`
+  variable on purpose. A connection failure was then reported as a *replay
+  divergence*, which is the wrong diagnosis for a harness problem. The parent
+  now passes the resolved env file, through `config.child_environment()` —
+  because only `config.py` may read the environment and a test enforces it.
+- **A new unsorted mapping iteration** in `provenance.py` (invariant 7), caught
+  by the static check rather than by review.
+
+Improvements beyond the roadmap, implemented rather than suggested:
+
+- **The bisect is real, not promised.** §8.4 says the bisect names the first
+  divergent field; a mismatch compares the stored per-step `state_hash`
+  sequence against the replayed one and reports the first index that differs
+  with both values. "These runs differ" is a symptom; "they differ from step
+  11" is a diagnosis.
+- **A replay writes nothing**, asserted by counting `events` before and after.
+  A verification pass that inserted its own copy of the log would make the M6
+  event count drift every time someone checked the M8 criterion.
+- **Replay targets are chosen deterministically** — ordered by `run_id`, taken
+  from the front. A random 25 would make a failure depend on which 25 were
+  drawn, and a green result would not mean the same thing twice.
+- **A run is replayed under the configuration it was made with.** Replaying an
+  ablation cell under the base configuration re-runs a *different experiment* —
+  different visibility policy, different graph arm, different grounding — and
+  would report the mismatch as non-determinism.
+- **`cascade retrieval index --drop-legacy`** removes IVFFlat indexes after the
+  HNSW pass rather than before, so the corpus is never unindexed mid-build.
+
+Deferred, with reasons:
+
+- **Criterion 3's measured reconciliation** → needs a phase that reaches the
+  model, which needs `CASCADE_ANTHROPIC_API_KEY`. The command, both readers and
+  the three verdicts are built and tested; only the numbers are missing.
+- **The retrieval p95** → closing it means annual partitioning, which is a
+  1.95M-row rewrite with a recall consequence that needs its own measurement.
+  The slope is measured (3.9 ms + 0.34 ms/partition) so the next session starts
+  from arithmetic rather than from a guess.
+- **M9 (presentation)** → the next milestone.

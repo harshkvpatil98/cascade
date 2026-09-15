@@ -1,85 +1,44 @@
-"""IVFFlat index sizing (ADR-0012, spec §4.2).
+"""HNSW index planning (ADR-0012, ADR-0026, spec §4.2).
 
-The sizing rule is pure so it can be tested without a database. The cases that
-matter are the degenerate ones: an empty partition, a one-row partition, and a
-partition large enough to hit the configured cap.
+The planning rule is pure so it can be tested without a database. What matters
+here is different from what mattered under IVFFlat: there is no row-dependent
+build parameter any more, so the interesting cases are the degenerate ones (an
+empty partition, an unindexed one) and the one remaining rebuild trigger (the
+configured parameters changed). A partition that has merely *grown* must plan
+as `keep` -- that is the drift class ADR-0026 retires, and a test is what keeps
+it retired.
 """
 
 from __future__ import annotations
-
-import math
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from cascade.retrieval.index import (
-    PGVECTOR_MAX_LISTS,
+    PGVECTOR_MAX_EF_CONSTRUCTION,
+    PGVECTOR_MAX_M,
     index_name_for,
     plan_all,
     plan_partition,
-    target_lists,
 )
 from cascade.retrieval.schema import PartitionIndex
 
-MAX = 2000
-TOL = 0.25
+M = 16
+EFC = 64
 
 
-def partition(name: str, rows: int, lists: int | None = None) -> PartitionIndex:
+def partition(
+    name: str, rows: int, m: int | None = None, ef_construction: int | None = None
+) -> PartitionIndex:
+    indexed = m is not None
     return PartitionIndex(
         partition=name,
         rows=rows,
-        index_name=index_name_for(name) if lists is not None else None,
-        lists=lists,
+        index_name=index_name_for(name) if indexed else None,
+        m=m,
+        ef_construction=ef_construction if indexed else None,
     )
-
-
-# ---------------------------------------------------------------------------
-# target_lists
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("rows", "expected"),
-    [
-        (0, 0),  # empty: no index at all
-        (1, 1),
-        (100, 10),
-        (2_400, 49),  # round, not truncate: sqrt is 48.99
-        (130_073, 361),  # the real 2016q4 partition
-        (1_300_000, 1140),  # the study target for one partition
-    ],
-)
-def test_target_lists_is_the_rounded_square_root(rows: int, expected: int) -> None:
-    assert target_lists(rows, max_lists=MAX) == expected
-
-
-def test_target_lists_rounds_rather_than_truncating() -> None:
-    """Truncation biases every partition low, widening lists and costing recall."""
-    assert target_lists(2_400, max_lists=MAX) == 49
-    assert int(math.sqrt(2_400)) == 48
-
-
-def test_target_lists_is_clamped_to_the_configured_maximum() -> None:
-    assert target_lists(10**9, max_lists=MAX) == MAX
-
-
-def test_target_lists_never_exceeds_pgvectors_own_ceiling() -> None:
-    """`lists` above 32768 is rejected by pgvector at CREATE INDEX time."""
-    assert target_lists(10**12, max_lists=10**9) == PGVECTOR_MAX_LISTS
-
-
-@pytest.mark.parametrize(("rows", "max_lists"), [(-1, MAX), (10, 0)])
-def test_target_lists_rejects_nonsense_inputs(rows: int, max_lists: int) -> None:
-    with pytest.raises(ValueError):
-        target_lists(rows, max_lists=max_lists)
-
-
-@given(st.integers(min_value=1, max_value=5_000_000))
-def test_target_lists_is_always_at_least_one_for_a_non_empty_partition(rows: int) -> None:
-    """A non-empty partition must never be planned with lists = 0."""
-    assert target_lists(rows, max_lists=MAX) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -87,55 +46,90 @@ def test_target_lists_is_always_at_least_one_for_a_non_empty_partition(rows: int
 # ---------------------------------------------------------------------------
 
 
-def test_an_empty_partition_is_skipped_not_indexed() -> None:
-    """An index built on no rows sends every later insert into one list."""
-    plan = plan_partition(partition("chunks_2027q4", 0), max_lists=MAX, tolerance=TOL)
-    assert plan.action == "skip-empty"
-    assert plan.target_lists == 0
+class TestPlanning:
+    def test_an_empty_partition_is_skipped(self) -> None:
+        """Building on nothing produces an index describing an empty graph."""
+        plan = plan_partition(partition("chunks_2027q4", 0), m=M, ef_construction=EFC)
+        assert plan.action == "skip-empty"
 
+    def test_an_unindexed_partition_is_created(self) -> None:
+        plan = plan_partition(partition("chunks_2016q4", 130_073), m=M, ef_construction=EFC)
+        assert plan.action == "create"
+        assert plan.target_m == M
+        assert plan.target_ef_construction == EFC
 
-def test_an_unindexed_non_empty_partition_is_created() -> None:
-    plan = plan_partition(partition("chunks_2016q4", 130_073), max_lists=MAX, tolerance=TOL)
-    assert plan.action == "create"
-    assert plan.target_lists == 361
+    def test_a_correctly_built_index_is_kept(self) -> None:
+        plan = plan_partition(
+            partition("chunks_2016q4", 130_073, m=M, ef_construction=EFC),
+            m=M,
+            ef_construction=EFC,
+        )
+        assert plan.action == "keep"
 
+    @pytest.mark.parametrize("rows", [130_073, 600_000, 5_000_000])
+    def test_growth_alone_never_triggers_a_rebuild(self, rows: int) -> None:
+        """ADR-0026's central claim, asserted rather than asserted-in-prose.
 
-def test_a_correctly_sized_index_is_kept() -> None:
-    plan = plan_partition(
-        partition("chunks_2016q4", 130_073, lists=361), max_lists=MAX, tolerance=TOL
+        Under IVFFlat `lists = sqrt(rows)`, so a partition that grew carried a
+        degraded index until a rebuild pass ran -- and that drift interrupted
+        M4, M5, M6 and M7 in turn. HNSW has no row-dependent parameter.
+        """
+        plan = plan_partition(
+            partition("chunks_2017q4", rows, m=M, ef_construction=EFC),
+            m=M,
+            ef_construction=EFC,
+        )
+        assert plan.action == "keep"
+        assert "no row-dependent parameter" in plan.reason
+
+    @pytest.mark.parametrize(
+        ("built_m", "built_efc"),
+        [(8, EFC), (M, 128), (32, 200)],
     )
-    assert plan.action == "keep"
+    def test_changed_build_parameters_trigger_a_rebuild(self, built_m: int, built_efc: int) -> None:
+        """The only remaining rebuild trigger, and it is an operator action."""
+        plan = plan_partition(
+            partition("chunks_2016q4", 130_073, m=built_m, ef_construction=built_efc),
+            m=M,
+            ef_construction=EFC,
+        )
+        assert plan.action == "rebuild"
+        assert str(built_m) in plan.reason or str(built_efc) in plan.reason
+
+    def test_an_empty_partition_is_skipped_even_with_odd_parameters(self) -> None:
+        plan = plan_partition(
+            partition("chunks_2027q4", 0, m=8, ef_construction=32), m=M, ef_construction=EFC
+        )
+        assert plan.action == "skip-empty"
 
 
-def test_an_index_within_tolerance_is_kept_rather_than_thrashed() -> None:
-    """Rebuilding a 130k-row partition on every insert would never finish."""
-    plan = plan_partition(
-        partition("chunks_2016q4", 130_073, lists=330), max_lists=MAX, tolerance=TOL
-    )
-    assert plan.action == "keep"
+class TestParameterValidation:
+    """Rejected here rather than by Postgres, so a misconfiguration fails
+    before the pass starts dropping indexes rather than midway through."""
 
+    @pytest.mark.parametrize("m", [1, 0, -4, PGVECTOR_MAX_M + 1])
+    def test_m_outside_pgvectors_range_is_refused(self, m: int) -> None:
+        with pytest.raises(ValueError, match="hnsw m must lie"):
+            plan_partition(partition("p", 10), m=m, ef_construction=1000)
 
-def test_an_index_outside_tolerance_is_rebuilt() -> None:
-    """Regression: a probe sweep left the corpus at sqrt(n)/8 and it was caught."""
-    plan = plan_partition(
-        partition("chunks_2016q4", 130_073, lists=45), max_lists=MAX, tolerance=TOL
-    )
-    assert plan.action == "rebuild"
-    assert plan.target_lists == 361
-    assert "drift" in plan.reason
+    @pytest.mark.parametrize("efc", [3, 0, PGVECTOR_MAX_EF_CONSTRUCTION + 1])
+    def test_ef_construction_outside_pgvectors_range_is_refused(self, efc: int) -> None:
+        with pytest.raises(ValueError, match="ef_construction must lie"):
+            plan_partition(partition("p", 10), m=M, ef_construction=efc)
 
+    def test_ef_construction_below_twice_m_is_refused(self) -> None:
+        """pgvector enforces this; a smaller value builds a degraded graph."""
+        with pytest.raises(ValueError, match="at least 2 \\* m"):
+            plan_partition(partition("p", 10), m=32, ef_construction=40)
 
-def test_drift_is_measured_against_the_target_not_the_current_value() -> None:
-    """An index at half the target must rebuild; at 0.8x it must not."""
-    rows = 10_000  # target 100
-    assert (
-        plan_partition(partition("p", rows, lists=50), max_lists=MAX, tolerance=TOL).action
-        == "rebuild"
-    )
-    assert (
-        plan_partition(partition("p", rows, lists=80), max_lists=MAX, tolerance=TOL).action
-        == "keep"
-    )
+    def test_the_pinned_defaults_are_valid(self) -> None:
+        from cascade.config import load_settings
+
+        retrieval = load_settings(None).retrieval
+        plan = plan_partition(
+            partition("p", 10), m=retrieval.hnsw_m, ef_construction=retrieval.hnsw_ef_construction
+        )
+        assert plan.action == "create"
 
 
 # ---------------------------------------------------------------------------
@@ -143,44 +137,69 @@ def test_drift_is_measured_against_the_target_not_the_current_value() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_plans_are_ordered_largest_partition_first() -> None:
-    """An interrupted pass should already have fixed what dominates latency."""
-    plans = plan_all(
-        [partition("small", 10), partition("huge", 100_000), partition("mid", 5_000)],
-        max_lists=MAX,
-        tolerance=TOL,
-    )
-    assert [plan.partition for plan in plans] == ["huge", "mid", "small"]
-
-
-def test_ties_break_on_name_so_the_order_is_deterministic() -> None:
-    """Invariant 7: iteration order is never left to chance."""
-    plans = plan_all(
-        [partition("b", 100), partition("a", 100), partition("c", 100)],
-        max_lists=MAX,
-        tolerance=TOL,
-    )
-    assert [plan.partition for plan in plans] == ["a", "b", "c"]
-
-
-def test_planning_is_idempotent_after_a_pass() -> None:
-    """A second run must be a no-op, or the command is not safe to re-run."""
-    measured = [partition("chunks_2016q4", 130_073), partition("chunks_2027q4", 0)]
-    first = plan_all(measured, max_lists=MAX, tolerance=TOL)
-
-    applied = [
-        (
-            partition(plan.partition, plan.rows, lists=plan.target_lists)
-            if plan.action in {"create", "rebuild"}
-            else partition(plan.partition, plan.rows)
+class TestPlanAll:
+    def test_plans_are_ordered_largest_partition_first(self) -> None:
+        """An interrupted pass should already have indexed what dominates latency."""
+        plans = plan_all(
+            [partition("small", 10), partition("huge", 100_000), partition("mid", 5_000)],
+            m=M,
+            ef_construction=EFC,
         )
-        for plan in first
-    ]
-    second = plan_all(applied, max_lists=MAX, tolerance=TOL)
-    assert {plan.action for plan in second} <= {"keep", "skip-empty"}
+        assert [plan.partition for plan in plans] == ["huge", "mid", "small"]
+
+    def test_ties_break_on_name_so_the_order_is_deterministic(self) -> None:
+        """Invariant 7: iteration order is never left to chance."""
+        plans = plan_all(
+            [partition("b", 100), partition("a", 100), partition("c", 100)],
+            m=M,
+            ef_construction=EFC,
+        )
+        assert [plan.partition for plan in plans] == ["a", "b", "c"]
+
+    def test_planning_is_idempotent_after_a_pass(self) -> None:
+        """A second run must be a no-op, or the command is not safe to re-run."""
+        measured = [partition("chunks_2016q4", 130_073), partition("chunks_2027q4", 0)]
+        first = plan_all(measured, m=M, ef_construction=EFC)
+
+        applied = [
+            (
+                partition(
+                    plan.partition,
+                    plan.rows,
+                    m=plan.target_m,
+                    ef_construction=plan.target_ef_construction,
+                )
+                if plan.action in {"create", "rebuild"}
+                else partition(plan.partition, plan.rows)
+            )
+            for plan in first
+        ]
+        second = plan_all(applied, m=M, ef_construction=EFC)
+        assert {plan.action for plan in second} <= {"keep", "skip-empty"}
+
+    @given(st.integers(min_value=1, max_value=10_000_000))
+    def test_a_built_partition_at_any_size_stays_kept(self, rows: int) -> None:
+        """The property the whole change rests on, quantified over sizes."""
+        plan = plan_partition(
+            partition("p", rows, m=M, ef_construction=EFC), m=M, ef_construction=EFC
+        )
+        assert plan.action == "keep"
+
+    def test_every_plan_is_accounted_for(self) -> None:
+        measured = [
+            partition("a", 0),
+            partition("b", 10),
+            partition("c", 10, m=M, ef_construction=EFC),
+        ]
+        plans = plan_all(measured, m=M, ef_construction=EFC)
+        assert len(plans) == 3
+        assert {p.action for p in plans} == {"skip-empty", "create", "keep"}
 
 
-def test_index_names_are_derived_from_the_partition() -> None:
-    """`verify` must be able to say "unindexed" without a registry to consult."""
-    assert index_name_for("chunks_2016q4") == "chunks_2016q4_embedding_ivfflat_idx"
+def test_index_names_carry_the_access_method() -> None:
+    """So an IVFFlat index left by a pre-ADR-0026 database is not mistaken for
+    this one -- it does not exist under the name the command looks for, and the
+    partition plans as `create`."""
+    assert index_name_for("chunks_2016q4") == "chunks_2016q4_embedding_hnsw_idx"
+    assert "ivfflat" not in index_name_for("chunks_2016q4")
     assert len(index_name_for("chunks_2016q4")) < 64  # Postgres identifier limit

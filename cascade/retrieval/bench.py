@@ -3,7 +3,7 @@
 Reports p50/p95/p99 **and** recall@20 against exhaustive search. Both, always,
 in the same report. A latency number without a recall number says only that
 the index returned something quickly, and the cheapest way to return something
-quickly is to return the wrong thing -- `probes = 1` would halve the p95 and
+quickly is to return the wrong thing -- `ef_search = 1` would halve the p95 and
 quietly cost most of the recall the study depends on.
 
 Recall is measured on a sample (`retrieval.bench_recall_sample`, 5%) because
@@ -59,7 +59,10 @@ class BenchResult:
     distinct_cutoffs: int
     earliest_cutoff: str
     latest_cutoff: str
-    probes: int
+    ef_search: int
+    """The `hnsw.ef_search` pinned into the deployed function, not the
+    configured one: a bench that read config would be comparing config with
+    itself."""
     elapsed_s: float
 
     def meets(self, settings: Settings) -> tuple[bool, tuple[str, ...]]:
@@ -160,9 +163,9 @@ def run_bench(
     # `eval` rather than `sim`: the exact oracle is granted only to eval, and
     # running both arms on one connection keeps the comparison honest about
     # cache state. The indexed arm is identical under either role -- the same
-    # SECURITY DEFINER function with the same pinned probes.
+    # SECURITY DEFINER function with the same pinned ef_search.
     with Chronofence(settings, role="eval") as fence:
-        probes = fence.probes()
+        ef_search = fence.ef_search()
         for index, (query, vector) in enumerate(zip(queries, vectors, strict=True)):
             result = fence.search(vector, as_of=query.as_of, k=k)
             latencies.append(result.elapsed_ms)
@@ -188,6 +191,6 @@ def run_bench(
         distinct_cutoffs=len(cutoffs),
         earliest_cutoff=cutoffs[0].isoformat(),
         latest_cutoff=cutoffs[-1].isoformat(),
-        probes=probes,
+        ef_search=ef_search,
         elapsed_s=time.monotonic() - started,
     )
